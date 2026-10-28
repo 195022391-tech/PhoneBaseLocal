@@ -1,0 +1,14 @@
+{
+  "name": "phonebase-desktop-local",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Electron LAN viewer for non-commercial PhoneBase (licenseRequired=false)",
+  "type": "module",
+  "main": "主进程/main.mjs",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^37.2.0"
+  }
+}

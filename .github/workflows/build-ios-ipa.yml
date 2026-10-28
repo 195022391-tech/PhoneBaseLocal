@@ -1,0 +1,70 @@
+name: Build PhoneBaseLocal IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "应用/本地基座-iOS/**"
+      - ".github/workflows/build-ios-ipa.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: macOS unsigned IPA (TrollStore)
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: 应用/本地基座-iOS
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Archive (no Apple signing)
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          xcodebuild \
+            -project PhoneBaseLocal.xcodeproj \
+            -scheme PhoneBaseLocal \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/PhoneBaseLocal.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            archive
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="$(find build/PhoneBaseLocal.xcarchive/Products/Applications -name '*.app' -maxdepth 1 | head -n1)"
+          test -n "$APP"
+          rm -rf build/Payload
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/
+          (
+            cd build
+            zip -qry "PhoneBaseLocal-unsigned.ipa" Payload
+          )
+          ls -lh build/PhoneBaseLocal-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhoneBaseLocal-unsigned-ipa
+          path: 应用/本地基座-iOS/build/PhoneBaseLocal-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14

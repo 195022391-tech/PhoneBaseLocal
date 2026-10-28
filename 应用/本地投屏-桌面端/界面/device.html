@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' ws: wss: http: https:; img-src 'self' data:; script-src 'self'; style-src 'self'" />
+  <title>设备投屏</title>
+  <link rel="stylesheet" href="./device.css" />
+  <link rel="stylesheet" href="./rotation-menu.css" />
+</head>
+<body>
+  <main id="device-window" class="device-window" data-mode="landscape">
+    <header class="device-header" aria-label="标题栏">
+      <div class="header-drag">
+        <strong id="device-title" class="header-title">设备投屏</strong>
+        <span class="header-sep" aria-hidden="true">·</span>
+        <span class="header-label">ID</span>
+        <span id="device-short-id">—</span>
+        <span id="demo-label" hidden>演示</span>
+        <span id="network-rtt" title="手机状态接口请求、响应读取和处理的总耗时">接口 RTT —</span>
+        <span id="device-address" class="header-address">正在连接</span>
+      </div>
+      <div class="window-controls">
+        <button id="win-min" class="win-btn" type="button" aria-label="最小化" title="最小化">─</button>
+        <button id="win-max" class="win-btn" type="button" aria-label="最大化" title="最大化">□</button>
+        <button id="close-device" class="win-btn win-close" type="button" aria-label="关闭" title="关闭">×</button>
+      </div>
+    </header>
+    <section id="screen" class="device-screen" aria-label="设备实时画面">
+      <canvas id="device-canvas" tabindex="0" aria-label="实时手机画面；可直接点击、拖动、长按，并可用键盘输入"></canvas>
+      <div id="screen-placeholder" class="screen-placeholder">
+        <img src="./icons/smartphone.svg" alt="">
+        <strong id="screen-title">正在连接设备</strong>
+        <span id="screen-status" role="status">正在读取设备</span>
+      </div>
+      <div id="stream-notice" class="stream-notice" role="status" hidden></div>
+    </section>
+    <nav class="device-tools" aria-label="设备工具">
+      <button id="open-details" class="tool-button" title="连接信息" aria-label="查看连接信息"><img src="./icons/wifi.svg" alt=""><span>网络</span></button>
+      <button id="rotate-device" class="tool-button" type="button" title="旋转预览显示方向" aria-label="旋转预览显示方向" aria-haspopup="menu" aria-expanded="false" aria-controls="rotation-device-menu"><img src="./icons/rotate-cw.svg" alt=""><span>旋转</span></button>
+      <button id="capture-device" class="tool-button" title="保存当前画面为 PNG" aria-label="保存手机截图" disabled><img src="./icons/scissors.svg" alt=""><span>截图</span></button>
+      <button id="toggle-text-input" class="tool-button" type="button" title="显示或收起文本输入" aria-label="文本输入" aria-expanded="false" aria-pressed="false"><img src="./icons/copy.svg" alt=""><span>文本</span></button>
+      <button id="open-settings" class="tool-button" title="画面信息" aria-label="打开画面设置"><img src="./icons/settings.svg" alt=""><span>设置</span></button>
+      <div class="tool-spacer"></div>
+      <button id="home-device" class="tool-button" title="返回手机主屏幕" aria-label="返回手机主屏幕 Home" disabled><img src="./icons/home.svg" alt=""><span>Home</span></button>
+      <button id="maximize-device" class="tool-button" title="放大设备窗口" aria-label="放大设备窗口"><img src="./icons/maximize-2.svg" alt=""><span>放大</span></button>
+    </nav>
+    <div id="device-keyboard-tools" class="device-keyboard-tools" hidden>
+      <div class="phone-keyboard-input">
+        <textarea id="device-text-input" rows="2" maxlength="2000" placeholder="在此输入文字后点发送；日常可直接点画面后用键盘输入" aria-label="手机文本"></textarea>
+        <div class="phone-keyboard-actions">
+          <button id="device-text-send" class="button primary" type="button">发送</button>
+          <span id="device-text-status" class="phone-keyboard-status" role="status"></span>
+        </div>
+      </div>
+    </div>
+    <textarea id="device-key-capture" class="device-key-capture" aria-label="手机键盘输入" tabindex="-1" autocomplete="off"></textarea>
+    <div id="rotation-device-menu" class="rotation-menu" role="menu" aria-label="旋转预览显示方向" hidden>
+      <span class="rotation-menu-status" aria-live="polite">当前 0°</span>
+      <button type="button" role="menuitem" data-rotation="90">向右旋转 90°</button>
+      <button type="button" role="menuitem" data-rotation="-90">向左旋转 90°</button>
+      <button type="button" role="menuitem" data-rotation="180">旋转 180°</button>
+      <button type="button" role="menuitem" data-rotation="reset">恢复原始方向</button>
+    </div>
+  </main>
+
+  <dialog id="settings-dialog" class="device-dialog">
+    <header class="dialog-heading">
+      <h1>画面设置</h1>
+      <button class="close-dialog" type="button" aria-label="关闭画面设置"><img src="./icons/x.svg" alt=""></button>
+    </header>
+    <section class="video-settings">
+      <div class="settings-heading"><span>当前流配置</span></div>
+      <p class="video-settings-applied" id="settings-profile">foreground · 全分辨率</p>
+      <p class="video-settings-message" role="status">独立设备窗口使用全分辨率画面（与官方一致）；设备墙缩略图仍为墙模式以降低占用。</p>
+    </section>
+    <p class="dialog-note">自动使用手机支持的上限；实际帧率随手机负载和网络变化。</p>
+  </dialog>
+
+  <dialog id="details-dialog" class="device-dialog">
+    <header class="dialog-heading">
+      <h1>连接信息</h1>
+      <button class="close-dialog" type="button" aria-label="关闭连接信息"><img src="./icons/x.svg" alt=""></button>
+    </header>
+    <dl class="connection-details">
+      <div><dt>设备名称</dt><dd id="detail-name">—</dd></div>
+      <div><dt>设备 ID</dt><dd id="detail-id">—</dd></div>
+      <div><dt>IP / 端口</dt><dd id="detail-address">—</dd></div>
+      <div><dt>画面分辨率</dt><dd id="detail-resolution">—</dd></div>
+      <div><dt>实际帧率</dt><dd id="detail-fps">—</dd></div>
+      <div><dt>状态接口 RTT</dt><dd id="detail-network">—</dd></div>
+      <div><dt>控制往返 RTT</dt><dd id="detail-control">—</dd></div>
+      <div><dt>控制状态</dt><dd id="detail-status">—</dd></div>
+    </dl>
+    <p class="dialog-note">接口 RTT 包含手机处理请求的耗时，与纯网络 ping 不同；不代表完整画面延迟。</p>
+  </dialog>
+
+  <script type="module" src="./device.js"></script>
+</body>
+</html>

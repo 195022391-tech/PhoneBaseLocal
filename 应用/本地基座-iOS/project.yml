@@ -1,0 +1,29 @@
+name: PhoneBaseLocal
+options:
+  bundleIdPrefix: cn.local.phonebase
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+targets:
+  PhoneBaseLocal:
+    type: application
+    platform: iOS
+    sources:
+      - path: PhoneBaseLocal
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cn.local.phonebase.local
+        PRODUCT_NAME: PhoneBaseLocal
+        GENERATE_INFOPLIST_FILE: false
+        INFOPLIST_FILE: PhoneBaseLocal/Info.plist
+        CODE_SIGN_ENTITLEMENTS: PhoneBaseLocal/PhoneBaseLocal.entitlements
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: false
+    dependencies: []

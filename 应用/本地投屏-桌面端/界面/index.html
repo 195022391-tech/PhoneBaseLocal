@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' ws: wss: http: https:; img-src 'self' data:; script-src 'self'; style-src 'self'" />
+  <title>手机投屏与控制 · 设备管理</title>
+  <link rel="stylesheet" href="./style.css" />
+  <link rel="stylesheet" href="./rotation-menu.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand-mark" title="手机投屏与控制"><img src="./icons/smartphone.svg" alt=""></div>
+      <button class="nav-item active" aria-label="设备管理" title="设备管理"><img src="./icons/layout-grid.svg" alt=""><span>设备</span></button>
+      <div class="sidebar-spacer"></div>
+      <button id="connection-info" class="nav-item" aria-label="连接信息" title="连接信息"><img src="./icons/monitor.svg" alt=""><span>连接</span></button>
+      <div class="sidebar-version" title="Desktop Local">0.1.0</div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div class="page-heading">
+          <h1 id="page-brand">手机投屏与控制</h1>
+          <span id="workspace-label">本地工作台</span>
+        </div>
+        <span id="health" class="service-state">本地就绪</span>
+      </header>
+      <div class="fleet-layout">
+        <aside id="device-panel" class="device-panel" aria-label="设备管理列表">
+          <div class="panel-search">
+            <label class="search-field">
+              <img src="./icons/search.svg" alt="">
+              <input id="search" type="search" placeholder="搜索设备" aria-label="搜索设备" autocomplete="off">
+            </label>
+            <button id="refresh-devices" class="icon-button" title="刷新设备" aria-label="刷新设备"><img src="./icons/refresh-cw.svg" alt=""></button>
+          </div>
+          <div class="panel-filters">
+            <select id="status-filter" aria-label="设备状态">
+              <option value="all">全部状态</option>
+              <option value="online">在线设备</option>
+              <option value="offline">离线设备</option>
+            </select>
+            <select id="sort-mode" aria-label="设备排序">
+              <option value="manual">手动排序</option>
+              <option value="name">设备名称</option>
+              <option value="id">设备 ID</option>
+              <option value="ip">IP 地址</option>
+              <option value="online">在线优先</option>
+            </select>
+          </div>
+          <div class="device-table-head">
+            <label><input id="select-all" type="checkbox" aria-label="全选当前设备"></label>
+            <span>序号 / ID</span><span>名称</span><span>状态</span>
+          </div>
+          <div class="device-group">
+            <img src="./icons/chevron-down.svg" alt="">
+            <strong>我的设备</strong>
+            <span id="count">0</span>
+            <button id="open-add" class="icon-button" aria-label="添加设备" title="添加设备"><img src="./icons/plus.svg" alt=""></button>
+          </div>
+          <div id="device-rows" class="device-rows" role="list" aria-label="设备列表"></div>
+          <div class="panel-bottom">
+            <span>在线 <b id="online-count">0</b> 台</span>
+            <span id="selected-count" hidden></span>
+            <button id="clear-selection" class="text-button" hidden>清除</button>
+          </div>
+        </aside>
+        <div class="device-panel-rail">
+          <button id="device-panel-toggle" class="device-panel-toggle" type="button" aria-controls="device-panel" aria-expanded="true" aria-label="收起设备列表" title="收起设备列表">
+            <img src="./icons/chevron-down.svg" alt="">
+          </button>
+        </div>
+        <div class="wall-workspace">
+          <div class="workspace-actions">
+            <div class="topbar-actions">
+              <button id="scan" class="button secondary" title="重新探测已保存设备"><img src="./icons/radar.svg" alt="">扫描设备</button>
+              <button id="add-device-action" class="button secondary"><img src="./icons/plus.svg" alt="">添加设备</button>
+              <button id="batch-actions" class="button secondary" type="button" disabled><img src="./icons/mouse-pointer-2.svg" alt="">批量操作</button>
+              <button id="delete-selected" class="button secondary delete-selected" type="button" title="删除选中的电脑设备记录" disabled hidden><img src="./icons/trash-2.svg" alt=""><span>删除选中</span></button>
+            </div>
+            <span id="wall-upgrade" class="upgrade-note" role="status" hidden></span>
+            <label class="low-usage" title="降低分辨率和码率（15 fps；大卡片最高 512）。取消勾选后大卡片可达 768，更清晰">
+              <input id="low-usage" type="checkbox">
+              <span class="switch-track" aria-hidden="true"></span>
+              <span>低占用</span>
+            </label>
+          </div>
+          <div class="fleet-toolbar" aria-label="设备视图设置">
+            <div class="fleet-tabs">
+              <button id="tab-all" class="fleet-tab selected">全部设备</button>
+              <button id="tab-online" class="fleet-tab">在线设备</button>
+            </div>
+            <div class="toolbar-options">
+              <label class="zoom-setting">
+                缩放
+                <input id="tile-zoom" type="range" min="96" max="420" value="320" step="1" aria-label="设备缩放">
+                <output id="zoom-value" for="tile-zoom">320</output>
+              </label>
+              <div id="wall-orientation" class="orientation-switch" role="group" aria-label="设备墙显示方向">
+                <button class="orientation-button" data-wall-mode="portrait" aria-pressed="false"><img src="./icons/smartphone.svg" alt="">竖屏</button>
+                <button class="orientation-button selected" data-wall-mode="landscape" aria-pressed="true"><img src="./icons/monitor.svg" alt="">横屏</button>
+              </div>
+            </div>
+          </div>
+          <main id="wall-scroll" class="wall-scroll" aria-label="设备墙；滚轮缩放，滚动条浏览设备">
+            <div id="message" class="message" role="status" hidden></div>
+            <div id="devices" class="devices" aria-label="设备画面" data-presentation="landscape"></div>
+            <section id="empty" class="empty">
+              <div class="empty-icon"><img src="./icons/smartphone.svg" alt=""></div>
+              <h2 id="empty-title">添加第一台设备</h2>
+              <p id="empty-description">在手机上开启服务，然后扫描设备或手动添加。</p>
+              <button id="empty-add" class="button primary"><img src="./icons/plus.svg" alt="">添加设备</button>
+            </section>
+          </main>
+          <footer class="statusbar">
+            <span id="summary">正在读取设备</span>
+            <span id="demo-banner" class="demo-banner" hidden>演示设备</span>
+            <span id="order-hint">拖动设备调整顺序</span>
+            <span id="mode-status">低占用 · 15 fps</span>
+          </footer>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <dialog id="management" class="management-dialog">
+    <div class="dialog-heading">
+      <div>
+        <h2>添加设备</h2>
+        <p>手机和电脑需要连接同一局域网。</p>
+      </div>
+      <button class="icon-button close-dialog" aria-label="关闭添加设备"><img src="./icons/x.svg" alt=""></button>
+    </div>
+    <div class="management-body">
+      <form id="add-form">
+        <label>手机 IP<input id="phone-ip" placeholder="192.168.110.20" autocomplete="off" required></label>
+        <label class="port">端口<input id="phone-port" type="number" min="1" max="65535" value="11019" required></label>
+        <button id="add" class="button primary" type="submit">添加设备</button>
+      </form>
+      <p id="management-status" role="status" class="management-status" hidden></p>
+      <div class="dialog-note">
+        <img src="./icons/radar.svg" alt="">
+        <span>新版基座固定端口 11019。按 IP 和端口连接，无需填写设备 ID；也可使用「扫描设备」发现同网段的手机。</span>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="discovery-dialog" class="discovery-dialog" aria-labelledby="discovery-title">
+    <div class="dialog-heading">
+      <div>
+        <span class="dialog-eyebrow">DEVICE DISCOVERY</span>
+        <h2 id="discovery-title">搜索局域网设备</h2>
+        <p>先在手机上开启基座服务，再搜索当前电脑所在的网段。</p>
+      </div>
+      <button class="icon-button close-dialog" aria-label="关闭搜索设备"><img src="./icons/x.svg" alt=""></button>
+    </div>
+    <div class="discovery-body">
+      <div class="scan-controls">
+        <label>搜索网络
+          <select id="scan-network" aria-label="搜索网络">
+            <option value="">当前连接网络</option>
+          </select>
+        </label>
+        <label id="scan-segment-field" class="scan-segment-field" hidden>扫描分段
+          <input id="scan-segment" type="number" min="1" max="1" step="1" value="1" aria-label="扫描分段" required>
+        </label>
+        <button id="scan-start" class="button primary" type="button"><img src="./icons/radar.svg" alt="">开始搜索</button>
+        <button id="scan-stop" class="button secondary" type="button" hidden>停止</button>
+      </div>
+      <div class="scan-progress">
+        <div>
+          <span id="scan-status" role="status" aria-live="polite">点击开始搜索发现设备。</span>
+          <span id="scan-range"></span>
+        </div>
+        <progress id="scan-progress" max="100" value="0" aria-label="设备搜索进度"></progress>
+      </div>
+      <div class="discovery-table">
+        <div class="discovery-table-head">
+          <label><input id="scan-select-all" type="checkbox" aria-label="选择全部搜索结果"></label>
+          <span>设备名称</span>
+          <span>IP / 端口</span>
+          <span>状态</span>
+        </div>
+        <div id="discoveries" class="discoveries">
+          <div class="discovery-empty">搜索结果将显示在这里</div>
+        </div>
+      </div>
+      <p id="scan-result" class="form-status" role="status" aria-live="polite"></p>
+      <div class="discovery-footer">
+        <span id="scan-quota">仅支持非商业本地基座；添加后会出现在设备墙。</span>
+        <div>
+          <button id="scan-add-selected" class="button secondary" type="button" disabled>添加选中</button>
+          <button id="scan-add-all" class="button primary" type="button" disabled>添加全部</button>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="delete-devices-dialog" class="delete-devices-dialog" aria-labelledby="delete-devices-title" aria-describedby="delete-devices-description">
+    <div class="dialog-heading">
+      <div>
+        <h2 id="delete-devices-title">删除选中设备</h2>
+        <p id="delete-device-count">本次将删除 0 台设备</p>
+      </div>
+      <button class="icon-button close-dialog" type="button" aria-label="关闭删除设备"><img src="./icons/x.svg" alt=""></button>
+    </div>
+    <div class="deletion-body">
+      <p id="delete-devices-description">仅移除这台电脑保存的设备记录，不删除手机 App 或手机数据。以后可扫描或手动重新添加。</p>
+      <ul id="delete-device-list" class="deletion-list" aria-label="本次删除设备"></ul>
+      <p id="delete-devices-status" class="deletion-status" role="status" aria-live="polite"></p>
+      <div class="deletion-actions">
+        <button id="cancel-delete-devices" class="button secondary" type="button">取消</button>
+        <button id="confirm-delete-devices" class="button delete-confirm" type="button">删除 0 台设备</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="device-preview" class="preview-dialog" aria-label="设备预览">
+    <article class="device preview-device" data-device-id="">
+      <div class="preview-heading">
+        <div class="preview-title">
+          <span class="preview-number">001</span>
+          <strong class="preview-name"></strong>
+          <span class="preview-status"></span>
+        </div>
+        <button id="close-preview" class="icon-button" aria-label="关闭设备预览"><img src="./icons/x.svg" alt=""></button>
+      </div>
+      <div class="preview-workspace">
+        <div class="preview-main">
+          <div class="preview-tools">
+            <div class="orientation-switch" role="group" aria-label="预览显示方向">
+              <button class="orientation-button selected" data-mode="portrait" data-orientation="portrait" aria-pressed="true"><img src="./icons/smartphone.svg" alt="">竖屏</button>
+              <button class="orientation-button" data-mode="landscape" data-orientation="landscape" aria-pressed="false"><img src="./icons/monitor.svg" alt="">横屏</button>
+            </div>
+            <div class="preview-rotation-control">
+              <button id="rotate-preview" class="button secondary" type="button" aria-label="旋转预览显示方向" aria-haspopup="menu" aria-expanded="false" aria-controls="rotation-preview-menu"><img src="./icons/rotate-cw.svg" alt="">旋转</button>
+              <div id="rotation-preview-menu" class="rotation-menu" role="menu" aria-label="旋转预览显示方向" hidden>
+                <span class="rotation-menu-status" aria-live="polite">当前 0°</span>
+                <button type="button" role="menuitem" data-rotation="90">向右旋转 90°</button>
+                <button type="button" role="menuitem" data-rotation="-90">向左旋转 90°</button>
+                <button type="button" role="menuitem" data-rotation="180">旋转 180°</button>
+                <button type="button" role="menuitem" data-rotation="reset">恢复原始方向</button>
+              </div>
+            </div>
+            <span class="preview-stream-state">正在连接画面</span>
+          </div>
+          <div class="phone-stage">
+            <div class="phone-shell" data-presentation="portrait" data-orientation="portrait">
+              <div class="screen phone-display">
+                <canvas id="preview-canvas" aria-label="预览画面"></canvas>
+                <div class="placeholder" id="preview-placeholder">
+                  <img src="./icons/smartphone.svg" alt="">
+                  <strong>正在连接手机</strong>
+                  <span>等待画面</span>
+                </div>
+              </div>
+              <div class="phone-bottom">
+                <button class="home-button" id="preview-home" aria-label="返回手机主屏幕（Home）" title="开始控制后可使用 Home 键" disabled><img src="./icons/home.svg" alt=""></button>
+                <span>Home</span>
+              </div>
+            </div>
+          </div>
+          <div class="preview-actionbar">
+            <span class="control-status" role="status">等待画面后可开启控制</span>
+            <button class="control button primary" id="preview-control" disabled><img src="./icons/mouse-pointer-2.svg" alt=""><span>开始控制</span></button>
+          </div>
+        </div>
+        <aside class="device-info">
+          <h3>设备详情</h3>
+          <label class="order-setting">设备序号
+            <div>
+              <input id="device-order" type="number" min="1" max="1000" aria-label="设备序号">
+              <button id="save-device-order" class="button secondary">保存</button>
+            </div>
+          </label>
+          <div class="detail-row">
+            <div class="detail-label">设备 ID<button class="copy-id text-button" id="copy-device-id" title="复制设备 ID"><img src="./icons/copy.svg" alt="">复制</button></div>
+            <code class="device-id" tabindex="0" id="preview-device-id"></code>
+          </div>
+          <div class="detail-row">
+            <span class="detail-label">IP / 端口</span>
+            <span class="device-address" id="preview-address"></span>
+          </div>
+          <dl class="device-metrics">
+            <div><dt>分辨率</dt><dd class="metric-resolution resolution" id="preview-resolution">—</dd></div>
+            <div><dt>实际帧率</dt><dd class="metric-fps fps" id="preview-fps">—</dd></div>
+            <div><dt>接口 RTT</dt><dd class="metric-network network-latency" id="preview-rtt">—</dd></div>
+            <div><dt>控制往返</dt><dd class="metric-control control-latency">—</dd></div>
+            <div><dt>采集服务内存</dt><dd class="metric-memory">—</dd></div>
+            <div><dt>内存保护</dt><dd class="metric-memory-protection">—</dd></div>
+          </dl>
+          <p class="metrics-note">往返时间供连接诊断，不代表完整画面延迟。</p>
+          <div class="preview-detail-bottom">
+            <span class="home-status"></span>
+            <button class="remove text-button danger" id="preview-remove"><img src="./icons/trash-2.svg" alt="">移除设备</button>
+            <button class="button secondary" id="preview-open-window" type="button"><img src="./icons/maximize-2.svg" alt="">独立窗口</button>
+          </div>
+        </aside>
+      </div>
+    </article>
+  </dialog>
+
+  <div id="device-context-menu" class="device-context-menu" role="menu" aria-label="设备操作" hidden>
+    <button id="device-menu-preview" type="button" role="menuitem">详情 / 预览</button>
+    <button id="device-menu-edit" type="button" role="menuitem">修改设备名称与备注</button>
+  </div>
+
+  <dialog id="device-metadata-dialog" class="device-metadata-dialog" aria-labelledby="device-metadata-title">
+    <div class="dialog-heading">
+      <div>
+        <h2 id="device-metadata-title">设备名称与备注</h2>
+        <p id="device-metadata-description">仅保存在本机，便于区分多台设备。</p>
+      </div>
+      <button class="icon-button close-dialog" type="button" aria-label="关闭设备资料"><img src="./icons/x.svg" alt=""></button>
+    </div>
+    <form id="device-metadata-form" class="device-metadata-form">
+      <div class="metadata-number-row">
+        <span>设备序号 <strong id="device-metadata-number">—</strong></span>
+        <span>可在列表中直接改序号</span>
+      </div>
+      <label>显示名称<input id="device-alias" maxlength="80" autocomplete="off" placeholder="留空使用手机默认名称"></label>
+      <label>备注<textarea id="device-remark" maxlength="500" rows="4" placeholder="用途、负责人或其他设备说明"></textarea></label>
+      <div class="metadata-real-id"><span>真实设备 ID</span><code id="device-metadata-id"></code></div>
+      <div class="metadata-real-id" style="margin-top:12px"><span>IP / 端口</span><code id="device-metadata-address"></code></div>
+      <p id="device-metadata-status" class="form-status" role="status"></p>
+      <div class="metadata-actions">
+        <button id="device-metadata-reload" class="button secondary" type="button">恢复手机名称</button>
+        <button id="device-metadata-save" class="button primary" type="submit">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="connection-dialog" class="connection-dialog">
+    <div class="dialog-heading">
+      <h2>连接信息</h2>
+      <button class="icon-button close-dialog" aria-label="关闭连接信息"><img src="./icons/x.svg" alt=""></button>
+    </div>
+    <div class="connection-body">
+      <p id="connection-description">本客户端直连手机局域网基座，无需云端鉴权。仅接受 licenseRequired=false 的本地基座。</p>
+      <div id="local-access"><span>工作模式</span><a id="local-url" href="#">Desktop Local · 纯本地</a></div>
+    </div>
+  </dialog>
+
+  <dialog id="batch-dialog" class="batch-dialog" aria-labelledby="batch-title">
+    <div class="dialog-heading">
+      <div>
+        <span class="dialog-eyebrow">BATCH OPERATIONS</span>
+        <h2 id="batch-title">批量操作</h2>
+        <p id="batch-selection-count">已选择 0 台设备</p>
+      </div>
+      <button class="icon-button close-dialog" type="button" aria-label="关闭批量操作"><img src="./icons/x.svg" alt=""></button>
+    </div>
+    <div class="batch-body">
+      <div class="batch-options">
+        <div>
+          <h3>连接与显示</h3>
+          <p>同步操作前，请让各台手机处于相同界面。</p>
+        </div>
+        <button id="batch-reconnect" class="button secondary" type="button"><img src="./icons/refresh-cw.svg" alt="">重新连接</button>
+        <select id="batch-orientation" aria-label="批量显示方向">
+          <option value="portrait">竖屏模式</option>
+          <option value="landscape">横屏模式</option>
+        </select>
+        <button id="batch-apply-orientation" class="button secondary" type="button">应用显示方向</button>
+        <div class="batch-quality">
+          <label>目标帧率
+            <select id="batch-frame-rate">
+              <option value="15">15 fps</option>
+              <option value="20">20 fps</option>
+              <option value="30" selected>30 fps</option>
+            </select>
+          </label>
+          <label>码率 Mbps
+            <input id="batch-bitrate" type="number" value="3" min="1" max="20" step="1">
+          </label>
+          <button id="batch-apply-video" class="button secondary" type="button">应用画质</button>
+        </div>
+      </div>
+      <section class="batch-sync">
+        <div class="batch-sync-heading">
+          <div>
+            <h3>主控同步操作</h3>
+            <p>最多同时控制 20 台；尺寸、方向和画面状态一致时才参与同步。</p>
+          </div>
+          <span id="batch-state-badge" class="batch-state-badge">未启动</span>
+        </div>
+        <div class="batch-sync-controls">
+          <label>主控设备
+            <select id="batch-source"></select>
+          </label>
+          <button id="batch-start" class="button primary" type="button"><img src="./icons/mouse-pointer-2.svg" alt="">开始同步</button>
+          <button id="batch-home" class="button secondary" type="button" disabled><img src="./icons/home.svg" alt="">Home</button>
+          <button id="batch-stop" class="button batch-stop" type="button" disabled>停止同步</button>
+        </div>
+        <div id="batch-canvas-stage" class="batch-canvas-stage" hidden>
+          <canvas id="batch-canvas" aria-label="批量主控设备画面"></canvas>
+        </div>
+        <p id="batch-status" class="form-status" role="status" aria-live="polite">同步未启动</p>
+        <div id="batch-device-status" class="batch-device-status"></div>
+      </section>
+      <p id="batch-operation-status" class="form-status" role="status"></p>
+    </div>
+  </dialog>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

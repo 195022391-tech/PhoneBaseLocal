@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>本地投屏客户端</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header class="bar">
+    <strong>本地投屏</strong>
+    <label>IP <input id="ip" value="192.168.9.6" spellcheck="false" /></label>
+    <label>端口 <input id="port" value="11019" inputmode="numeric" /></label>
+    <button id="connect" type="button">连接</button>
+    <button id="disconnect" type="button" disabled>断开</button>
+    <span id="status" class="status">未连接</span>
+  </header>
+  <main>
+    <canvas id="stage" width="750" height="1334"></canvas>
+    <aside id="meta"></aside>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -1,0 +1,177 @@
+[
+  {
+    "file": "03_ports_defaults.js",
+    "marker": "03_ports_defaults",
+    "offset": 536251,
+    "length": 1756,
+    "preview": "var Ni=11019,Ku=8879,XE=100,ZE=999,$u=/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/,kr=(e,t=400)=>Object.assign(new Error(e),{statu"
+  },
+  {
+    "file": "05_device_validate.js",
+    "marker": "05_device_validate",
+    "offset": 538007,
+    "length": 351,
+    "preview": "e.protocol!==\"lan-phonebase\"||e.version!==\"1.0\"||typeof e.deviceId!=\"string\"||!$u.test(e.deviceId)||typeof e.name!=\"stri"
+  },
+  {
+    "file": "04_device_schema.js",
+    "marker": "04_device_schema",
+    "offset": 538358,
+    "length": 1605,
+    "preview": "protocol:\"lan-phonebase\",version:\"1.0\",port:t,deviceId:e.deviceId,name:e.name.trim().slice(0,80),streaming:e.streaming,w"
+  },
+  {
+    "file": "06_mdns_browse.js",
+    "marker": "06_mdns_browse",
+    "offset": 539963,
+    "length": 376,
+    "preview": "find({type:\"phonebase\",protocol:\"tcp\"},c=>{for(let o of c.addresses??[])Bs(o,e)&&Number.isInteger(c.port)&&c.port>=1&&c."
+  },
+  {
+    "file": "07_scan_pool.js",
+    "marker": "07_scan_pool",
+    "offset": 540339,
+    "length": 27290,
+    "preview": "async function Op(e,t,r){let i=new Array(e.length),s=0;return await Promise.all(Array.from({length:Math.min(t,e.length)}"
+  },
+  {
+    "file": "09_release_handshake.js",
+    "marker": "09_release_handshake",
+    "offset": 567629,
+    "length": 11206,
+    "preview": "\"/release/handshake\",{release:e,installId:t,event:p&&f!==B?\"startup\":y,observedHashes:D});if(h!==P||m!==B)throw Fi(\"账号会话"
+  },
+  {
+    "file": "08_commercial_base.js",
+    "marker": "08_commercial_base",
+    "offset": 578835,
+    "length": 6854,
+    "preview": "var Oo=\"https://47.94.92.125:8443/commercial/v1\",Ye=(e,t=400,r=\"COMMERCIAL_ERROR\")=>Object.assign(new Error(e),{status:t"
+  },
+  {
+    "file": "10_account_store.js",
+    "marker": "10_account_store",
+    "offset": 585689,
+    "length": 9767,
+    "preview": "\"account-client-id\"),D;try{D=(await Qu(b,\"utf8\")).trim()}catch(U){if(U.code!==\"ENOENT\")throw U}Ps.test(D??\"\")||(D=mS(),a"
+  },
+  {
+    "file": "23_ws_license_header.js",
+    "marker": "23_ws_license_header",
+    "offset": 595456,
+    "length": 649,
+    "preview": "X-PhoneBase-License\":`${U.payload}.${U.signature}`});async function Ut(U,se,Oe){let Be=J.get(U);if(!Be||!ne.has(U)||!Pe."
+  },
+  {
+    "file": "17_api_license.js",
+    "marker": "17_api_license",
+    "offset": 596105,
+    "length": 19156,
+    "preview": "\"/api/license/identity\",void 0,{},dt);xt();let sr;try{let xr=Gu({key:Buffer.from(wt.publicKey,\"base64\"),format:\"der\",typ"
+  },
+  {
+    "file": "14_api_account.js",
+    "marker": "14_api_account",
+    "offset": 615261,
+    "length": 13879,
+    "preview": "\"/api/account\"&&!Oe.startsWith(\"/api/account/\"))return!1;try{if(F)throw Ye(\"账号客户端已关闭\",503);if(qt(U),await Q(),Oe===\"/api"
+  },
+  {
+    "file": "19_local_guest.js",
+    "marker": "19_local_guest",
+    "offset": 629140,
+    "length": 26471,
+    "preview": "\"/local-guest/handshake\",nt)}):null,w=fe(),g=()=>({...A??{},id:A?.id??null,quota:ln,boundCount:Z.size,usedCount:Z.size,r"
+  },
+  {
+    "file": "13_health_caps.js",
+    "marker": "13_health_caps",
+    "offset": 655611,
+    "length": 1432,
+    "preview": "homeControl:!0,networkRtt:!0,phoneMemory:!0,controlRecovery:!0,controlGeometryRecovery:!0,deviceRotation:!0,batchRemoval"
+  },
+  {
+    "file": "18_api_rental.js",
+    "marker": "18_api_rental",
+    "offset": 657043,
+    "length": 1593,
+    "preview": "\"/api/rental/\"))){if(!hi(A))return Er(N,403,{error:\"云发布账号操作必须来自当前页面\"});let _e=m?.();return _e?await _e.handle(A,N,j)?voi"
+  },
+  {
+    "file": "15_api_devices.js",
+    "marker": "15_api_devices",
+    "offset": 658636,
+    "length": 1764,
+    "preview": "\"/api/devices\")return y&&!u&&await y.prepareLocalDevices?.(l.records()),Er(N,200,{devices:(await l.list({refresh:L.searc"
+  },
+  {
+    "file": "16_api_scan.js",
+    "marker": "16_api_scan",
+    "offset": 660400,
+    "length": 9760,
+    "preview": "\"/api/scan\",\"/api/devices\"].includes(j)||A.method===\"DELETE\"&&ve){if(!F)return Er(N,403,{error:\"扫描、添加和移除设备只能在服务器电脑的 loca"
+  },
+  {
+    "file": "20_gateway.js",
+    "marker": "20_gateway",
+    "offset": 670160,
+    "length": 972,
+    "preview": "\"/gateway/register\"),512*1024,!0),v={socket:g,ready:!1,deadline:null,seenSessions:new Set};N=v,F++,v.deadline=setTimeout"
+  },
+  {
+    "file": "24_control_msgs.js",
+    "marker": "24_control_msgs",
+    "offset": 671132,
+    "length": 80000,
+    "preview": "\"control-request\"){if(typeof le.deviceId!=\"string\"||!na.test(le.deviceId)||!C.some(V=>V.id===le.deviceId)||typeof le.ses"
+  },
+  {
+    "file": "22_p2p_stun.js",
+    "marker": "22_p2p_stun",
+    "offset": 1056394,
+    "length": 33727,
+    "preview": "stun:47.94.92.125:8445\"}={}){if(!m1.test(t||\"\"))throw Br(\"P2P_VIEWER_INVALID\",\"signaling\");let d=new URL(e);if(!/^[A-Za-"
+  },
+  {
+    "file": "25_http_server_listen.js",
+    "marker": "25_http_server_listen",
+    "offset": 1090121,
+    "length": 8184,
+    "preview": "ve.listen(0,\"127.0.0.1\",()=>{ve.off(\"error\",Z),te()})});try{S=await A1({mainServer:e,publicDirectory:r,sourceAllowed:G,c"
+  },
+  {
+    "file": "21_direct_host.js",
+    "marker": "21_direct_host",
+    "offset": 1098305,
+    "length": 19985,
+    "preview": "\"/direct-host/prepare\"){let Ee=await Zc(te);$(oe);let ke=await pe(Ee,oe,Z);return $(oe),Pi(Z,200,ke),!0}if(te.method===\""
+  },
+  {
+    "file": "11_tls_paths.js",
+    "marker": "11_tls_paths",
+    "offset": 1118290,
+    "length": 1324,
+    "preview": "tls/server-cert.pem\"))]);OE({key:j,cert:$}),u=DE({key:j,cert:$},(F,O)=>d.emit(\"request\",F,O)),P1(u,b),u.on(\"upgrade\",(F,"
+  },
+  {
+    "file": "00_banner_help.js",
+    "marker": "00_banner_help",
+    "offset": 1119614,
+    "length": 207,
+    "preview": "PhoneBase desktop backend   node entry.mjs --runtime-dir ABS --public-dir ABS --ipa-file ABS     [--http-port 3000] [--h"
+  },
+  {
+    "file": "01_cli_parse.js",
+    "marker": "01_cli_parse",
+    "offset": 1119821,
+    "length": 607,
+    "preview": "function R1(e,{input:t=process.stdin,onError:r=i=>console.error(i.message)}={}){let i=\"\",s=0,n=!1,a=!1,c,o=new Promise(u"
+  },
+  {
+    "file": "02_cli_main.js",
+    "marker": "02_cli_main",
+    "offset": 1120428,
+    "length": 1134,
+    "preview": "async function D1(e=process.argv.slice(2)){let t=I1(e);if(t.help){process.stdout.write(y8);return}let r=await k1(t);if(t"
+  }
+]
