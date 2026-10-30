@@ -31,19 +31,18 @@ final class IOHIDTouchInjector: TouchInjector {
 
     let isAvailable: Bool
 
-    // tipa include-spi/IOKitSPI.h
+    // tipa include-spi/IOKitSPI.h — Range=1<<0 Touch=1<<1 Position=1<<2
     private static let transducerHand: UInt32 = 3
+    private static let digRange: UInt32 = 1 << 0
     private static let digTouch: UInt32 = 1 << 1
     private static let digPosition: UInt32 = 1 << 2
-    private static let digIdentity: UInt32 = 1 << 5
-    private static let digAttribute: UInt32 = 1 << 6
     private static let fieldIsBuiltIn: UInt32 = 4
     private static let fieldDisplayIntegrated: UInt32 = (11 << 16) | 25
     private static let fieldMajorRadius: UInt32 = (11 << 16) | 20
     private static let fieldMinorRadius: UInt32 = (11 << 16) | 21
     private static let defaultMajorRadius: Double = 5
     private static let defaultPathPressure: Double = 0
-    private static let defaultTwist: Double = 90
+    private static let defaultTwist: Double = 0
 
     static func makeIfPossible() -> IOHIDTouchInjector? {
         let inj = IOHIDTouchInjector()
@@ -201,7 +200,8 @@ final class IOHIDTouchInjector: TouchInjector {
         }
     }
 
-    /// tipa `-[STHIDEventGenerator _createIOHIDEventType:]`
+    /// baguette/vphone：down+move 保持 Range|Touch|Position(0x07)，
+    /// 清掉 Touch 会被当成断触 → 滑动卡卡。
     private func postHand(phase: Phase, x: Double, y: Double) {
         guard
             let createDigitizer,
@@ -212,42 +212,30 @@ final class IOHIDTouchInjector: TouchInjector {
         else { return }
 
         let isTouching = (phase == .touched || phase == .moved)
-
-        var eventMask: UInt32 = Self.digTouch
-        switch phase {
-        case .moved:
-            eventMask &= ~Self.digTouch
-            eventMask |= Self.digPosition
-            eventMask |= Self.digAttribute
-        case .touched, .lifted:
-            eventMask |= Self.digIdentity
-        }
-
+        // 0x07 sustained；0x06 lift（Touch|Position）
+        let eventMask: UInt32 = isTouching
+            ? (Self.digRange | Self.digTouch | Self.digPosition)
+            : (Self.digTouch | Self.digPosition)
+        let rangeBit: Int32 = isTouching ? 1 : 0
+        let touchBit: Int32 = isTouching ? 1 : 0
+        let radius = isTouching ? Self.defaultMajorRadius : 0
         let ts = mach_absolute_time()
 
-        // parent: coords 全 0；range 恒 0；touch = isTouching
         guard let parent = createDigitizer(
             kCFAllocatorDefault, ts,
-            Self.transducerHand, 0, 0, eventMask, 0,
-            0, 0, 0, 0, 0,
-            0, isTouching ? 1 : 0, 0
+            Self.transducerHand, 0, fingerId, eventMask, 0,
+            x, y, 0, Self.defaultPathPressure, 0,
+            rangeBit, touchBit, 0
         ) else { return }
 
         setInteger(parent, Self.fieldIsBuiltIn, 1)
         setInteger(parent, Self.fieldDisplayIntegrated, 1)
 
-        // tipa: InRange=1<<0, InTouch=1<<1
-        let proximity: UInt8 = isTouching ? 0x03 : 0
-        let rangeBit: Int32 = (proximity & 0x01) != 0 ? 1 : 0
-        let touchBit: Int32 = (proximity & 0x02) != 0 ? 1 : 0
-        let pressure = isTouching ? Self.defaultPathPressure : 0
-        let radius = isTouching ? Self.defaultMajorRadius : 0
-
         if let finger = createFinger(
             kCFAllocatorDefault, ts,
             fingerId, fingerId, eventMask,
             x, y, 0,
-            pressure,
+            Self.defaultPathPressure,
             Self.defaultTwist,
             rangeBit, touchBit, 0
         ) {

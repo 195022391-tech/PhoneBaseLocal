@@ -142,7 +142,7 @@ final class BaseRuntime {
     private func startupMessage(retired: [String], extra: String?) -> String {
         let ips = LanAddress.ipv4List().joined(separator: ", ")
         var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)"
-        msg += "\nbuild=0.1.22-hid-move"
+        msg += "\nbuild=0.1.23-hid-swipe"
         msg += "\ncapture=\(capture.backendName) encode=\(encodeW)x\(encodeH)"
         msg += "\ndeviceId=\(cachedDeviceId)"
         if let extra, !extra.isEmpty { msg += "\n\(extra)" }
@@ -184,8 +184,8 @@ final class BaseRuntime {
             "encoder": publisher.encoder.stats,
             "release": [
                 "product": "local",
-                "version": "0.1.22",
-                "buildId": "local-rebuild-0.1.22-hid-move",
+                "version": "0.1.23",
+                "buildId": "local-rebuild-0.1.23-hid-swipe",
             ],
             "geometry": [
                 "width": w,
