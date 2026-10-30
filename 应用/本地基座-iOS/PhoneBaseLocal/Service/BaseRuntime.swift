@@ -91,12 +91,13 @@ final class BaseRuntime {
             isRunning = true
             if notifyStatus {
                 let ips = LanAddress.ipv4List().joined(separator: ", ")
-                var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.13-ws-send\ndeviceId=\(cachedDeviceId)"
+                var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.14-encode\ndeviceId=\(cachedDeviceId)"
                 if !retired.killed.isEmpty {
                     msg += "\n已结束旧版：\(retired.killed.joined(separator: ", "))"
                 }
                 notify(msg)
             }
+            publisher.requestKeyframe()
             return true
         } catch {
             // 仍失败则再清一轮冲突（含 Direct）并重试一次
@@ -108,8 +109,9 @@ final class BaseRuntime {
                 isRunning = true
                 if notifyStatus {
                     let ips = LanAddress.ipv4List().joined(separator: ", ")
-                    notify("服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.13-ws-send\n二次清理后启动 ✓\n已结束：\((retired.killed + freed.killed).joined(separator: ", "))")
+                    notify("服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.14-encode\n二次清理后启动 ✓\n已结束：\((retired.killed + freed.killed).joined(separator: ", "))")
                 }
+                publisher.requestKeyframe()
                 return true
             } catch {
                 if notifyStatus {
@@ -162,8 +164,8 @@ final class BaseRuntime {
             "licenseRequired": false,
             "release": [
                 "product": "local",
-                "version": "0.1.13",
-                "buildId": "local-rebuild-0.1.13-ws-send",
+                "version": "0.1.14",
+                "buildId": "local-rebuild-0.1.14-encode",
             ],
             "geometry": [
                 "width": w,

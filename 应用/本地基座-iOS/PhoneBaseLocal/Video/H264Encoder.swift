@@ -25,6 +25,16 @@ final class H264Encoder {
 
     func start() throws {
         queue.sync {
+            if let old = session {
+                VTCompressionSessionInvalidate(old)
+                session = nil
+            }
+            let attrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                kCVPixelBufferWidthKey as String: Int(width),
+                kCVPixelBufferHeightKey as String: Int(height),
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+            ]
             var sess: VTCompressionSession?
             let status = VTCompressionSessionCreate(
                 allocator: kCFAllocatorDefault,
@@ -32,24 +42,27 @@ final class H264Encoder {
                 height: height,
                 codecType: kCMVideoCodecType_H264,
                 encoderSpecification: nil,
-                imageBufferAttributes: nil,
+                imageBufferAttributes: attrs as CFDictionary,
                 compressedDataAllocator: nil,
                 outputCallback: compressionCallback,
                 refcon: Unmanaged.passUnretained(self).toOpaque(),
                 compressionSessionOut: &sess
             )
             guard status == noErr, let sess else {
+                NSLog("[H264] VTCompressionSessionCreate failed status=%d size=%dx%d", status, width, height)
                 return
             }
             VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
             VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
             VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: 3_000_000 as CFNumber)
-            VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 30 as CFNumber)
+            VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 20 as CFNumber)
             VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 30 as CFNumber)
+            VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
             VTCompressionSessionPrepareToEncodeFrames(sess)
             self.session = sess
             self.sentConfig = false
             self.forceNextKeyFrame = true
+            NSLog("[H264] encoder ready %dx%d", width, height)
         }
     }
 
@@ -77,7 +90,7 @@ final class H264Encoder {
                 self.forceNextKeyFrame = false
                 props = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
             }
-            VTCompressionSessionEncodeFrame(
+            let status = VTCompressionSessionEncodeFrame(
                 session,
                 imageBuffer: buffer,
                 presentationTimeStamp: presentationTime,
@@ -86,15 +99,17 @@ final class H264Encoder {
                 sourceFrameRefcon: nil,
                 infoFlagsOut: &flags
             )
+            if status != noErr {
+                NSLog("[H264] EncodeFrame status=%d", status)
+            }
         }
     }
 
     fileprivate func handle(sampleBuffer: CMSampleBuffer) {
-        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
-              let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer)
-        else { return }
-
-        let isKeyframe = !(attachments.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
+        // Attachments may be absent; do not drop the bitstream when they are.
+        guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true) as? [[CFString: Any]]
+        let isKeyframe = !(attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let timestampUs = UInt64(max(0, pts.seconds * 1_000_000))
 
@@ -111,8 +126,22 @@ final class H264Encoder {
               let dataPointer, length > 0
         else { return }
 
+        // Prefer NAL-based IDR detection; attachments are not always reliable.
         let avcc = Data(bytes: dataPointer, count: length)
-        onFrame?(avcc, isKeyframe, timestampUs)
+        let key = isKeyframe || Self.avccContainsIdr(avcc)
+        onFrame?(avcc, key, timestampUs)
+    }
+
+    private static func avccContainsIdr(_ data: Data) -> Bool {
+        var i = 0
+        while i + 4 <= data.count {
+            let n = Int(data[i]) << 24 | Int(data[i + 1]) << 16 | Int(data[i + 2]) << 8 | Int(data[i + 3])
+            i += 4
+            guard n > 0, i + n <= data.count else { return false }
+            if (data[i] & 0x1f) == 5 { return true }
+            i += n
+        }
+        return false
     }
 
     private static func avcC(from format: CMFormatDescription) -> Data? {
