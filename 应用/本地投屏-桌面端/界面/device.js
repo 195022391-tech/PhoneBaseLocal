@@ -1,4 +1,12 @@
-import { ControlClient, VideoSession, mapControlKey, normalizeControlText } from "./player.js";
+import {
+  ControlClient,
+  VideoSession,
+  mapControlKey,
+  normalizeControlText,
+  mapPointerCoords,
+  presentationRotationFor,
+  createPointerMoveScheduler,
+} from "./player.js";
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -17,51 +25,166 @@ $("detail-id").textContent = deviceId || "—";
 $("detail-address").textContent = ip ? `${ip}:${port}` : "—";
 $("device-window").dataset.mode = presentation;
 
+/** 对齐官方 M.rotation / presentationRotation */
 let rotation = 0;
+/** 展示尺寸（源按 rotation 换边），对齐 phonebase-device-rotate 的 width/height */
+let displayWidth = 0;
+let displayHeight = 0;
+/** 用户点旋转菜单后锁定；切 portrait/landscape 模式时清空 */
+let explicitRotation = null;
+/** /api/info 或 geometry 的源分辨率（未旋转） */
+let deviceSource = { width: 0, height: 0 };
 let controlling = false;
 let control = null;
 let session = null;
 let fpsTimer = null;
 let lastFrames = 0;
 let lastFitKey = "";
+/** 点过「放大」后保持拉满，避免 onSize/方向回调把窗又收小 */
+let preferFillWorkArea = false;
+let fitInFlight = false;
+let fitTimer = null;
+let homeBusy = false;
+/** 由 bindPointer 写入：Home 前取消手势（对齐官方 cancelGesture） */
+let cancelActiveGesture = () => {};
+
+function normRotation(deg) {
+  return ((Number(deg) % 360) + 360) % 360;
+}
+
+/** 手机原始帧尺寸（未旋转），供 De() / Ve() */
+function sourceFrameSize() {
+  const g = control?.geometry;
+  if (g?.width && g?.height) return { width: g.width, height: g.height };
+  if (deviceSource.width && deviceSource.height) return { ...deviceSource };
+  const canvas = $("device-canvas");
+  return { width: canvas?.width || 0, height: canvas?.height || 0 };
+}
+
+/** 官方：M={mode,rotation,width,height} → displayWidth/Height，再 Ce + phonebase-device-rotate */
+function applyPresentation() {
+  const { width: w0, height: h0 } = sourceFrameSize();
+  let w = w0;
+  let h = h0;
+  if (!w || !h) {
+    w = deviceSource.width || 0;
+    h = deviceSource.height || 0;
+  }
+  rotation =
+    explicitRotation != null
+      ? normRotation(explicitRotation)
+      : presentationRotationFor(presentation, w, h);
+  const swap = rotation === 90 || rotation === 270;
+  displayWidth = swap ? h : w;
+  displayHeight = swap ? w : h;
+  const mode =
+    explicitRotation == null
+      ? presentation
+      : displayWidth > displayHeight
+        ? "landscape"
+        : "portrait";
+  $("device-window").dataset.mode = mode;
+  $("rotation-device-menu").querySelector(".rotation-menu-status").textContent = `当前 ${rotation}°`;
+  // 官方：模式用 Ve 旋进画面；旋转菜单改 presentationRotation，走 CSS（勿与 bake 叠两层）
+  const bakeMode = explicitRotation != null ? "original" : presentation;
+  session?.player?.setPresentation?.(bakeMode);
+  lastFitKey = "";
+  void fitWindowToVideo(preferFillWorkArea);
+}
 
 function setPresentation(mode) {
   presentation = mode === "portrait" ? "portrait" : "landscape";
-  $("device-window").dataset.mode = presentation;
-  session?.player?.setPresentation?.(presentation);
-  layoutCanvas();
-  lastFitKey = "";
-  fitWindowToVideo();
+  explicitRotation = null;
+  applyPresentation();
 }
 
-/** 与官方 Ce() 一致：按容器与旋转角设置 canvas CSS，避免旋转后留黑边 */
+/**
+ * 对齐官方 Ce()：style 按未旋转 bitmap 设宽高，再用 CSS rotate；
+ * 占位盒按旋转后换边 contain。宽高按同一 scale 推导，避免放大后独立 round 比例漂移导致 De 点偏。
+ */
 function layoutCanvas() {
   const screen = $("screen");
   const canvas = $("device-canvas");
   if (!screen || !canvas) return;
-  const swap = Math.abs(rotation) % 180 === 90;
-  const w = swap ? screen.clientHeight : screen.clientWidth;
-  const h = swap ? screen.clientWidth : screen.clientHeight;
-  canvas.style.width = `${Math.max(1, w)}px`;
-  canvas.style.height = `${Math.max(1, h)}px`;
-  canvas.style.transform = rotation
-    ? `translate(-50%, -50%) rotate(${rotation}deg)`
+  const cssRot = explicitRotation != null ? rotation : 0;
+  const sw = screen.clientWidth;
+  const sh = screen.clientHeight;
+  const cw = canvas.width || displayWidth;
+  const ch = canvas.height || displayHeight;
+  const boxW = cssRot % 180 === 90 ? ch : cw;
+  const boxH = cssRot % 180 === 90 ? cw : ch;
+  if (cw > 0 && ch > 0 && sw > 0 && sh > 0) {
+    const scale = Math.min(sw / boxW, sh / boxH);
+    // 先定一边再按源比例推另一边，避免放大后 W/H 独立 round 导致 De letterbox 点偏
+    const styleW = Math.max(1, Math.round(cw * scale));
+    const styleH = Math.max(1, Math.round((styleW * ch) / cw));
+    canvas.style.width = `${styleW}px`;
+    canvas.style.height = `${styleH}px`;
+  } else {
+    canvas.style.width = `${Math.max(1, sw)}px`;
+    canvas.style.height = `${Math.max(1, sh)}px`;
+  }
+  canvas.style.transform = cssRot
+    ? `translate(-50%, -50%) rotate(${cssRot}deg)`
     : "translate(-50%, -50%)";
-  $("device-window").dataset.mode = presentation;
 }
 
-/** 按画面比例调整窗口内容区，消除 object-fit:contain 上下/左右黑边 */
-function fitWindowToVideo() {
+/** 对齐官方 phonebase-device-rotate：用 displayWidth/Height 调窗 */
+async function fitWindowToVideo(fillWorkArea = false) {
+  if (fitInFlight) return;
+  let vw = displayWidth;
+  let vh = displayHeight;
+  // 无显式旋转且已 bake 时，canvas 即展示尺寸
   const canvas = $("device-canvas");
-  if (!canvas?.width || !canvas?.height) return;
-  const key = `${canvas.width}x${canvas.height}:${rotation}`;
-  if (key === lastFitKey) return;
+  const real =
+    explicitRotation == null &&
+    canvas &&
+    canvas.width >= 16 &&
+    canvas.height >= 16 &&
+    !(canvas.width === 300 && canvas.height === 150);
+  if (real && vw > 0 && vh > 0) {
+    const canvasLandscape = canvas.width >= canvas.height;
+    const displayLandscape = vw >= vh;
+    if (canvasLandscape === displayLandscape) {
+      vw = canvas.width;
+      vh = canvas.height;
+    }
+  } else if (real && (!vw || !vh)) {
+    vw = canvas.width;
+    vh = canvas.height;
+  }
+  if (!vw || !vh) {
+    layoutCanvas();
+    return;
+  }
+  const key = `${vw}x${vh}:${rotation}:${fillWorkArea ? "max" : "fit"}:${explicitRotation ?? "ve"}`;
+  if (key === lastFitKey) {
+    layoutCanvas();
+    return;
+  }
   lastFitKey = key;
-  window.desktopLocal?.fitDeviceContent?.({
-    videoWidth: canvas.width,
-    videoHeight: canvas.height,
-    rotation,
-  });
+  fitInFlight = true;
+  try {
+    await window.desktopLocal?.fitDeviceContent?.({
+      videoWidth: vw,
+      videoHeight: vh,
+      rotation: 0,
+      fillWorkArea: !!fillWorkArea,
+    });
+  } catch {
+    /* ignore */
+  } finally {
+    fitInFlight = false;
+  }
+  layoutCanvas();
+}
+
+/** Home 后画面剧变时合并 fit，避免放大窗连续 setContentSize 卡死 */
+function scheduleFitWindow(fillWorkArea = preferFillWorkArea) {
+  clearTimeout(fitTimer);
+  fitTimer = setTimeout(() => {
+    void fitWindowToVideo(fillWorkArea);
+  }, 120);
 }
 
 function setScreen(title, status) {
@@ -79,11 +202,8 @@ function setRtt(ms) {
 }
 
 function applyRotation(deg) {
-  rotation = deg;
-  $("rotation-device-menu").querySelector(".rotation-menu-status").textContent = `当前 ${deg}°`;
-  layoutCanvas();
-  lastFitKey = "";
-  fitWindowToVideo();
+  explicitRotation = normRotation(deg);
+  applyPresentation();
 }
 
 /** 官方独立设备窗口默认全分辨率 /video（不用墙模式 maxDimension） */
@@ -124,6 +244,10 @@ async function start() {
   $("detail-id").textContent = info.deviceId || deviceId || "—";
   $("device-address").textContent = `${body.ip}:${body.port}`;
   $("detail-address").textContent = `${body.ip}:${body.port}`;
+  const srcW = Number(info.geometry?.width || info.width) || 0;
+  const srcH = Number(info.geometry?.height || info.height) || 0;
+  if (srcW >= 2 && srcH >= 2) deviceSource = { width: srcW, height: srcH };
+  applyPresentation();
   const baseWs = `ws://${body.ip}:${body.port}`;
 
   const canvas = $("device-canvas");
@@ -137,13 +261,19 @@ async function start() {
       $("capture-device").disabled = false;
       setScreen("已连接", "画面就绪 · 可直接控制");
       $("detail-resolution").textContent = `${canvas.width}×${canvas.height}`;
-      layoutCanvas();
-      fitWindowToVideo();
+      applyPresentation();
     },
     onSize: (w, h) => {
       $("detail-resolution").textContent = `${w}×${h}`;
-      layoutCanvas();
-      fitWindowToVideo();
+      // 只同步展示尺寸并 layout，避免每次 onSize 清 lastFitKey 再 setContentSize 卡顿
+      if (Math.abs(displayWidth - w) > 1 || Math.abs(displayHeight - h) > 1) {
+        displayWidth = w;
+        displayHeight = h;
+        lastFitKey = "";
+        scheduleFitWindow(preferFillWorkArea);
+      } else {
+        layoutCanvas();
+      }
     },
     onStatus: (t) => {
       $("screen-status").textContent = t;
@@ -188,6 +318,10 @@ async function start() {
       onReady: (msg) => {
         $("detail-status").textContent = "控制中";
         updateTextCapability(msg);
+        if (msg?.geometry?.width && msg?.geometry?.height) {
+          deviceSource = { width: msg.geometry.width, height: msg.geometry.height };
+        }
+        applyPresentation();
       },
       onError: (e) => {
         $("detail-status").textContent = String(e);
@@ -209,6 +343,8 @@ async function start() {
 let inputArmed = false;
 let composing = false;
 let noticeTimer = null;
+/** 组字结束可能 beforeinput+compositionend 双发，短时去重 */
+let lastCompositionSent = { t: 0, text: "" };
 
 function setTextStatus(text, isError = false) {
   const el = $("device-text-status");
@@ -261,37 +397,83 @@ function focusKeyCapture() {
 }
 
 function bindPointer(canvas) {
-  const norm = (ev) => {
-    const rect = canvas.getBoundingClientRect();
-    return {
-      x: Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width)),
-      y: Math.min(1, Math.max(0, (ev.clientY - rect.top) / rect.height)),
-    };
+  const point = (ev, clamp) => {
+    // 官方 De(canvasRect, frameW, frameH, …, presentationRotation)：
+    // 始终用【源帧】+ 展示角；bake/CSS 只影响怎么画，不把 rot 置 0（放大后否则点位全偏）
+    const src = sourceFrameSize();
+    const fw = src.width;
+    const fh = src.height;
+    if (!fw || !fh) return null;
+    const rot =
+      explicitRotation != null
+        ? rotation
+        : presentationRotationFor(presentation, fw, fh);
+    return mapPointerCoords(
+      canvas.getBoundingClientRect(),
+      fw,
+      fh,
+      ev.clientX,
+      ev.clientY,
+      clamp,
+      rot
+    );
   };
   let pid = null;
+  // 官方：move ≤30fps 合并；up 前 flush 最后一点
+  const moves = createPointerMoveScheduler((x, y) => control?.pointer?.("move", x, y));
+  cancelActiveGesture = () => {
+    moves.clear();
+    if (pid == null) return;
+    try {
+      control?.pointer?.("cancel", 0, 0);
+    } catch {
+      /* ignore */
+    }
+    try {
+      canvas.releasePointerCapture?.(pid);
+    } catch {
+      /* ignore */
+    }
+    pid = null;
+  };
   canvas.onpointerdown = (ev) => {
     if (!controlling || !control?.ready) return;
     if (ev.button === 0) focusKeyCapture();
+    const pt = point(ev, false);
+    if (!pt) return;
+    moves.clear();
     canvas.setPointerCapture(ev.pointerId);
     pid = ev.pointerId;
-    const { x, y } = norm(ev);
-    control.pointer("down", x, y);
+    control.pointer("down", pt.x, pt.y);
+    ev.preventDefault();
   };
   canvas.onpointermove = (ev) => {
     if (pid !== ev.pointerId) return;
-    const { x, y } = norm(ev);
-    control.pointer("move", x, y);
+    const pt = point(ev, true);
+    if (!pt) return;
+    moves.move(pt.x, pt.y);
+    ev.preventDefault();
   };
   const up = (ev) => {
     if (pid !== ev.pointerId) return;
-    const { x, y } = norm(ev);
-    control.pointer("up", x, y);
+    const pt = point(ev, true);
+    moves.flush();
+    if (pt) control.pointer("up", pt.x, pt.y);
+    else moves.clear();
     pid = null;
     // 松手后夺回键盘焦点，避免被 canvas capture 抢走
     focusKeyCapture();
   };
   canvas.onpointerup = up;
   canvas.onpointercancel = up;
+}
+
+function sendCompositionText(raw) {
+  if (!raw) return;
+  const now = Date.now();
+  if (raw === lastCompositionSent.text && now - lastCompositionSent.t < 120) return;
+  lastCompositionSent = { t: now, text: raw };
+  void sendControlText(raw);
 }
 
 async function sendControlText(raw, { clearInput = false } = {}) {
@@ -382,7 +564,9 @@ function bindKeyboard(canvas) {
       if (!controlling || !control?.ready || !inputArmed || composing || e.isComposing) return;
       if (isTypingTarget(e.target)) return;
       if (e.inputType === "insertFromComposition") {
+        // 中文等 IME：以前只 prevent 不发送，组字结果被吞；数字不走组字所以看起来「数字行文字不行」
         e.preventDefault();
+        if (e.data) sendCompositionText(e.data);
         return;
       }
       if (e.inputType === "insertText" && e.data) {
@@ -412,13 +596,24 @@ function bindKeyboard(canvas) {
     });
     el.addEventListener("compositionend", (e) => {
       composing = false;
-      if (e.data) sendControlText(e.data);
+      if (e.data) sendCompositionText(e.data);
       if (capture) capture.value = "";
     });
     el.addEventListener("input", () => {
       if (!composing && capture && el === capture) capture.value = "";
     });
   }
+
+  // Electron 焦点常不在 canvas：窗口级也收组字结束
+  window.addEventListener("compositionstart", () => {
+    if (inputArmed) composing = true;
+  });
+  window.addEventListener("compositionend", (e) => {
+    if (!inputArmed) return;
+    composing = false;
+    if (e.data) sendCompositionText(e.data);
+    if (capture) capture.value = "";
+  });
 
   document.addEventListener(
     "pointerdown",
@@ -431,11 +626,31 @@ function bindKeyboard(canvas) {
   );
 }
 
+async function maximizeToWorkArea() {
+  preferFillWorkArea = !preferFillWorkArea;
+  await window.desktopLocal?.toggleMaximize?.();
+  lastFitKey = "";
+  await fitWindowToVideo(preferFillWorkArea);
+}
 $("win-min").onclick = () => window.desktopLocal?.windowMinimize?.();
-$("win-max").onclick = () => window.desktopLocal?.toggleMaximize?.();
+$("win-max").onclick = () => void maximizeToWorkArea();
 $("close-device").onclick = () => window.desktopLocal?.windowClose?.() ?? window.close();
-$("home-device").onclick = () => control?.home();
-$("maximize-device").onclick = () => window.desktopLocal?.toggleMaximize?.();
+$("home-device").onclick = (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  if (homeBusy || !control?.ready) return;
+  homeBusy = true;
+  // 官方：Home 前 cancelGesture，避免触控 capture 与放大窗 fit 缠在一起卡死
+  void control
+    .home({ cancelGesture: cancelActiveGesture })
+    .catch(() => {})
+    .finally(() => {
+      setTimeout(() => {
+        homeBusy = false;
+      }, 400);
+    });
+};
+$("maximize-device").onclick = () => void maximizeToWorkArea();
 window.desktopLocal?.onDeviceSetMode?.((payload) => {
   if (payload?.mode) setPresentation(payload.mode);
 });
@@ -484,10 +699,12 @@ $("rotation-device-menu").onclick = (e) => {
   const item = e.target.closest("[data-rotation]");
   if (!item) return;
   const v = item.dataset.rotation;
-  if (v === "reset") applyRotation(0);
-  else if (v === "90") applyRotation(90);
-  else if (v === "-90") applyRotation(-90);
-  else if (v === "180") applyRotation(180);
+  if (v === "reset") {
+    explicitRotation = null;
+    applyPresentation();
+  } else if (v === "90") applyRotation(rotation + 90);
+  else if (v === "-90") applyRotation(rotation - 90);
+  else if (v === "180") applyRotation(rotation + 180);
   $("rotation-device-menu").hidden = true;
 };
 

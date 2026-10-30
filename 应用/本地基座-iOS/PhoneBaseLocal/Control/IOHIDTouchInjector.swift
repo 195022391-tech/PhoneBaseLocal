@@ -149,25 +149,61 @@ final class IOHIDTouchInjector: TouchInjector {
         guard isAvailable, !text.isEmpty else { return }
         queue.async { [weak self] in
             guard let self else { return }
-            if self.postUnicode(text) { return }
+            // tipa/TrollVNC：ASCII 走键盘 usage；整段 Unicode 事件常被输入框忽略
+            var pending = ""
+            func flushPending() {
+                guard !pending.isEmpty else { return }
+                let chunk = pending
+                pending = ""
+                // Unicode HID 常建得出来但不进输入框；中文等一律剪贴板+Cmd+V
+                self.pasteViaClipboard(chunk)
+            }
             for ch in text {
                 if ch == "\n" || ch == "\r" {
+                    flushPending()
                     self.injectKeyLocked("enter")
                     continue
                 }
                 if ch == "\t" {
+                    flushPending()
                     self.injectKeyLocked("tab")
                     continue
                 }
-                let s = String(ch)
-                if !self.postUnicode(s), let usage = Self.asciiUsage(ch) {
-                    self.postKeyboard(usagePage: 0x07, usage: usage, down: true)
-                    usleep(6_000)
-                    self.postKeyboard(usagePage: 0x07, usage: usage, down: false)
-                    usleep(3_000)
+                if let usage = Self.asciiUsage(ch) {
+                    flushPending()
+                    self.postAsciiKey(ch, usage: usage)
+                    continue
                 }
+                pending.append(ch)
             }
+            flushPending()
         }
+    }
+
+    private func postAsciiKey(_ ch: Character, usage: UInt32) {
+        let shift = ch.isUppercase || Self.shiftedAscii.contains(ch)
+        if shift { postKeyboard(usagePage: 0x07, usage: 0xE1, down: true) }
+        postKeyboard(usagePage: 0x07, usage: usage, down: true)
+        usleep(6_000)
+        postKeyboard(usagePage: 0x07, usage: usage, down: false)
+        if shift { postKeyboard(usagePage: 0x07, usage: 0xE1, down: false) }
+        usleep(3_000)
+    }
+
+    /// 中文等：剪贴板 + Cmd+V（HID LeftGUI+V）
+    private func pasteViaClipboard(_ text: String) {
+        DispatchQueue.main.sync {
+            UIPasteboard.general.string = text
+        }
+        usleep(30_000)
+        postKeyboard(usagePage: 0x07, usage: 0xE3, down: true)
+        usleep(8_000)
+        postKeyboard(usagePage: 0x07, usage: 0x19, down: true)
+        usleep(20_000)
+        postKeyboard(usagePage: 0x07, usage: 0x19, down: false)
+        usleep(8_000)
+        postKeyboard(usagePage: 0x07, usage: 0xE3, down: false)
+        usleep(20_000)
     }
 
     func injectKey(_ key: String) {
@@ -300,6 +336,8 @@ final class IOHIDTouchInjector: TouchInjector {
         releaseFn?(UnsafeRawPointer(event))
     }
 
+    private static let shiftedAscii: Set<Character> = Set("!@#$%^&*()_+{}|:\"<>?~")
+
     private static func asciiUsage(_ ch: Character) -> UInt32? {
         guard let v = ch.asciiValue else { return nil }
         switch v {
@@ -308,17 +346,27 @@ final class IOHIDTouchInjector: TouchInjector {
         case 0x61 ... 0x7A: return UInt32(0x04 + (v - 0x61))
         case 0x41 ... 0x5A: return UInt32(0x04 + (v - 0x41))
         case 0x20: return 0x2C
-        case 0x2D: return 0x2D
-        case 0x3D: return 0x2E
-        case 0x5B: return 0x2F
-        case 0x5D: return 0x30
-        case 0x5C: return 0x31
-        case 0x3B: return 0x33
-        case 0x27: return 0x34
-        case 0x60: return 0x35
-        case 0x2C: return 0x36
-        case 0x2E: return 0x37
-        case 0x2F: return 0x38
+        case 0x2D, 0x5F: return 0x2D // - _
+        case 0x3D, 0x2B: return 0x2E // = +
+        case 0x5B, 0x7B: return 0x2F // [ {
+        case 0x5D, 0x7D: return 0x30 // ] }
+        case 0x5C, 0x7C: return 0x31 // \ |
+        case 0x3B, 0x3A: return 0x33 // ; :
+        case 0x27, 0x22: return 0x34 // ' "
+        case 0x60, 0x7E: return 0x35 // ` ~
+        case 0x2C, 0x3C: return 0x36 // , <
+        case 0x2E, 0x3E: return 0x37 // . >
+        case 0x2F, 0x3F: return 0x38 // / ?
+        case 0x21: return 0x1E // !
+        case 0x40: return 0x1F // @
+        case 0x23: return 0x20 // #
+        case 0x24: return 0x21 // $
+        case 0x25: return 0x22 // %
+        case 0x5E: return 0x23 // ^
+        case 0x26: return 0x24 // &
+        case 0x2A: return 0x25 // *
+        case 0x28: return 0x26 // (
+        case 0x29: return 0x27 // )
         default: return nil
         }
     }
