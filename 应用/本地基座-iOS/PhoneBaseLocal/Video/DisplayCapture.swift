@@ -169,10 +169,11 @@ final class DisplayCapture: NSObject {
             lastError = "pool alloc \(status)"
             return nil
         }
-        guard let surface = CVPixelBufferGetIOSurface(buffer) else {
+        guard let surfaceUnmanaged = CVPixelBufferGetIOSurface(buffer) else {
             lastError = "no IOSurface"
             return nil
         }
+        let surface = surfaceUnmanaged.takeUnretainedValue()
         // Direct helper: CARenderServerRenderDisplay(…, "LCD", surface, …)
         let rc = render(0, displayName, surface, 0, 0)
         if rc != 0 {
