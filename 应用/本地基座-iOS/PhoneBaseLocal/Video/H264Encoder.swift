@@ -64,10 +64,8 @@ final class H264Encoder {
     }
 
     func encode(buffer: CVPixelBuffer, presentationTime: CMTime) {
-        // Retain across async hop; pool may reuse otherwise.
-        CVPixelBufferRetain(buffer)
+        // Capture buffer in async closure (ARC keeps pool buffer alive until EncodeFrame returns).
         queue.async {
-            defer { CVPixelBufferRelease(buffer) }
             self.encodeAttempts += 1
             if self.recreateNeeded || self.session == nil {
                 self.openSessionLocked()
