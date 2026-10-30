@@ -14,15 +14,24 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         window.makeKeyAndVisible()
         self.window = window
         LocalNetworkPermission.shared.requestIfNeeded()
+        BackgroundKeepAlive.shared.start()
         runtime.start()
+        runtime.setStreamingActive(true)
         return true
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
-        runtime.setStreamingActive(false)
+        // 锁屏也保持发布端在线；靠 audio keepalive 不被挂起。
+        BackgroundKeepAlive.shared.start()
+        if runtime.isRunning {
+            runtime.setStreamingActive(true)
+        }
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
-        runtime.setStreamingActive(true)
+        BackgroundKeepAlive.shared.start()
+        if runtime.isRunning {
+            runtime.setStreamingActive(true)
+        }
     }
 }
