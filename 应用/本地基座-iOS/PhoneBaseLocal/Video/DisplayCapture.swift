@@ -27,8 +27,6 @@ final class DisplayCapture: NSObject {
 
     private var pool: CVPixelBufferPool?
     private var renderDisplay: RenderDisplayFn?
-    private var dirtyFrameCount: DirtyFrameFn?
-    private var lastDirty: UInt64 = .max
     private let displayName = "LCD" as CFString
 
     var onPixelBuffer: ((CVPixelBuffer, CMTime) -> Void)?
@@ -36,7 +34,6 @@ final class DisplayCapture: NSObject {
     private typealias RenderDisplayFn = @convention(c) (
         UInt32, CFString?, IOSurfaceRef?, Int32, Int32
     ) -> Int32
-    private typealias DirtyFrameFn = @convention(c) (UInt32, CFString?) -> UInt64
 
     init(width: Int, height: Int) {
         self.width = max(2, width - (width % 2))
@@ -54,10 +51,8 @@ final class DisplayCapture: NSObject {
         isActive = true
         wantsFrames = true
         frameIndex = 0
-        lastDirty = .max
         let link = CADisplayLink(target: self, selector: #selector(tick))
-        // 20fps 滑动观感必卡；对齐常见投屏 30
-        link.preferredFramesPerSecond = 30
+        link.preferredFramesPerSecond = 60
         link.add(to: .main, forMode: .common)
         displayLink = link
         NSLog("[Capture] start backend=%@ %dx%d", backendName, width, height)
@@ -77,10 +72,10 @@ final class DisplayCapture: NSObject {
     @objc private func tick() {
         guard wantsFrames else { return }
         frameIndex += 1
-        let pts = CMTime(value: frameIndex, timescale: 30)
+        let pts = CMTime(value: frameIndex, timescale: 60)
 
         if backend == .direct, let renderDisplay {
-            if shouldSkipUnchanged() { return }
+            // dirty-skip 会在滑动动画里漏帧 → 一点卡；静帧省电以后再说
             if let buffer = renderServerFrame(renderDisplay) {
                 renderedFrames += 1
                 onPixelBuffer?(buffer, pts)
@@ -100,14 +95,6 @@ final class DisplayCapture: NSObject {
         }
     }
 
-    private func shouldSkipUnchanged() -> Bool {
-        guard let dirtyFrameCount, frameIndex > 1, frameIndex % 30 != 0 else { return false }
-        let dirty = dirtyFrameCount(0, displayName)
-        if dirty == lastDirty { return true }
-        lastDirty = dirty
-        return false
-    }
-
     private func resolvePrivateAPIs() {
         let path = "/System/Library/Frameworks/QuartzCore.framework/QuartzCore"
         guard let handle = dlopen(path, RTLD_LAZY) else {
@@ -117,9 +104,6 @@ final class DisplayCapture: NSObject {
         }
         if let sym = dlsym(handle, "CARenderServerRenderDisplay") {
             renderDisplay = unsafeBitCast(sym, to: RenderDisplayFn.self)
-        }
-        if let sym = dlsym(handle, "CARenderServerGetDirtyFrameCount") {
-            dirtyFrameCount = unsafeBitCast(sym, to: DirtyFrameFn.self)
         }
         if renderDisplay != nil {
             backend = .direct

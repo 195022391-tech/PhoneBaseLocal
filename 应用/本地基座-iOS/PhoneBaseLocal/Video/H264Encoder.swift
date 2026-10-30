@@ -11,6 +11,10 @@ final class H264Encoder {
     private var sentConfig = false
     private var forceNextKeyFrame = false
     private var recreateNeeded = false
+    /// 60fps 时 async 堆积会追帧发糊；只编最新一帧
+    private var pendingBuffer: CVPixelBuffer?
+    private var pendingPts = CMTime.invalid
+    private var drainScheduled = false
 
     private(set) var ready = false
     private(set) var encodeAttempts: Int = 0
@@ -64,56 +68,67 @@ final class H264Encoder {
     }
 
     func encode(buffer: CVPixelBuffer, presentationTime: CMTime) {
-        // Capture buffer in async closure (ARC keeps pool buffer alive until EncodeFrame returns).
         queue.async {
-            self.encodeAttempts += 1
-            if self.recreateNeeded || self.session == nil {
-                self.openSessionLocked()
+            self.pendingBuffer = buffer
+            self.pendingPts = presentationTime
+            guard !self.drainScheduled else { return }
+            self.drainScheduled = true
+            while let buf = self.pendingBuffer {
+                self.pendingBuffer = nil
+                let pts = self.pendingPts
+                self.encodeOneLocked(buffer: buf, presentationTime: pts)
             }
-            guard let session = self.session else {
-                self.encodeErrors += 1
-                self.lastEncodeStatus = -1
-                return
-            }
+            self.drainScheduled = false
+        }
+    }
 
-            let bw = CVPixelBufferGetWidth(buffer)
-            let bh = CVPixelBufferGetHeight(buffer)
-            if bw != Int(self.width) || bh != Int(self.height) {
-                self.encodeErrors += 1
-                self.lastEncodeStatus = -2
-                if self.encodeErrors <= 5 || self.encodeErrors % 50 == 0 {
-                    NSLog("[H264] size mismatch buf=%dx%d sess=%dx%d", bw, bh, self.width, self.height)
-                }
-                return
-            }
+    private func encodeOneLocked(buffer: CVPixelBuffer, presentationTime: CMTime) {
+        encodeAttempts += 1
+        if recreateNeeded || session == nil {
+            openSessionLocked()
+        }
+        guard let session else {
+            encodeErrors += 1
+            lastEncodeStatus = -1
+            return
+        }
 
-            // Keep forcing IDR until avcC is out — otherwise viewer stays black.
-            var props: CFDictionary?
-            if self.forceNextKeyFrame || !self.sentConfig {
-                self.forceNextKeyFrame = false
-                props = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
+        let bw = CVPixelBufferGetWidth(buffer)
+        let bh = CVPixelBufferGetHeight(buffer)
+        if bw != Int(width) || bh != Int(height) {
+            encodeErrors += 1
+            lastEncodeStatus = -2
+            if encodeErrors <= 5 || encodeErrors % 50 == 0 {
+                NSLog("[H264] size mismatch buf=%dx%d sess=%dx%d", bw, bh, width, height)
             }
+            return
+        }
 
-            var flags: VTEncodeInfoFlags = []
-            let status = VTCompressionSessionEncodeFrame(
-                session,
-                imageBuffer: buffer,
-                presentationTimeStamp: presentationTime,
-                duration: .invalid,
-                frameProperties: props,
-                sourceFrameRefcon: nil,
-                infoFlagsOut: &flags
-            )
-            self.lastEncodeStatus = status
-            if status != noErr {
-                self.encodeErrors += 1
-                if status == Self.vtInvalidSession {
-                    self.recreateNeeded = true
-                    self.closeSessionLocked()
-                }
-                if self.encodeErrors <= 5 || self.encodeErrors % 50 == 0 {
-                    NSLog("[H264] EncodeFrame status=%d attempts=%d", status, self.encodeAttempts)
-                }
+        var props: CFDictionary?
+        if forceNextKeyFrame || !sentConfig {
+            forceNextKeyFrame = false
+            props = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
+        }
+
+        var flags: VTEncodeInfoFlags = []
+        let status = VTCompressionSessionEncodeFrame(
+            session,
+            imageBuffer: buffer,
+            presentationTimeStamp: presentationTime,
+            duration: .invalid,
+            frameProperties: props,
+            sourceFrameRefcon: nil,
+            infoFlagsOut: &flags
+        )
+        lastEncodeStatus = status
+        if status != noErr {
+            encodeErrors += 1
+            if status == Self.vtInvalidSession {
+                recreateNeeded = true
+                closeSessionLocked()
+            }
+            if encodeErrors <= 5 || encodeErrors % 50 == 0 {
+                NSLog("[H264] EncodeFrame status=%d attempts=%d", status, encodeAttempts)
             }
         }
     }
@@ -141,9 +156,9 @@ final class H264Encoder {
         }
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: 4_000_000 as CFNumber)
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 30 as CFNumber)
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 30 as CFNumber)
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: 6_000_000 as CFNumber)
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 60 as CFNumber)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTCompressionSessionPrepareToEncodeFrames(sess)
         session = sess
