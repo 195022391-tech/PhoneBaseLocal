@@ -30,8 +30,9 @@ final class BaseRuntime {
         screenHeight = size.height
         cachedName = DeviceIdentity.displayName
         cachedDeviceId = DeviceIdentity.deviceId
-        encodeW = min(max(size.width, 2), 720)
-        encodeH = min(max(size.height, 2), 1280)
+        // CARenderServer 按 IOSurface 像素画，小于物理分辨率会裁掉右边/底边（曾硬限 720×1280 → 只显示约 90%）
+        encodeW = max(2, size.width - (size.width % 2))
+        encodeH = max(2, size.height - (size.height % 2))
         publisher = FramePublisher(width: encodeW, height: encodeH)
         let inj = TouchInjectors.best()
         injector = inj
@@ -141,7 +142,7 @@ final class BaseRuntime {
     private func startupMessage(retired: [String], extra: String?) -> String {
         let ips = LanAddress.ipv4List().joined(separator: ", ")
         var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)"
-        msg += "\nbuild=0.1.20-lock-online"
+        msg += "\nbuild=0.1.21-fullframe"
         msg += "\ncapture=\(capture.backendName) encode=\(encodeW)x\(encodeH)"
         msg += "\ndeviceId=\(cachedDeviceId)"
         if let extra, !extra.isEmpty { msg += "\n\(extra)" }
@@ -183,8 +184,8 @@ final class BaseRuntime {
             "encoder": publisher.encoder.stats,
             "release": [
                 "product": "local",
-                "version": "0.1.20",
-                "buildId": "local-rebuild-0.1.20-lock-online",
+                "version": "0.1.21",
+                "buildId": "local-rebuild-0.1.21-fullframe",
             ],
             "geometry": [
                 "width": w,

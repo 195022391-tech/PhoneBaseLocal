@@ -10,7 +10,7 @@ final class FramePublisher {
     var onTimestampUs: ((UInt64) -> Void)?
 
     init(width: Int, height: Int) {
-        // Must match ScreenSampler / CVPixelBuffer size (portrait 720×1280 etc).
+        // Must match DisplayCapture / CVPixelBuffer size (native even screen size).
         encoder = H264Encoder(width: width, height: height)
         encoder.onConfig = { [weak self] avcC in
             self?.broadcastConfig(avcC)
