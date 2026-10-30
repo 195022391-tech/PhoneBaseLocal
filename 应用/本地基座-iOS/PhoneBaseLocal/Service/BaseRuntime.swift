@@ -67,14 +67,20 @@ final class BaseRuntime {
         server.onAccepted = { [weak self] count, ip in
             self?.notify("有连接 #\(count) from \(ip)")
         }
-        server.onVideoConnect = { [weak self] session in
-            self?.publisher.attach(session)
+        server.onVideoConnect = { [weak self] session, query in
+            guard let self else { return }
+            let profile = VideoStreamProfile.from(query: query, defaults: VideoSettingsStore.shared.defaults)
+            self.publisher.attach(session, profile: profile)
         }
         server.onControlConnect = { [weak self] session in
             self?.controlHub.attach(session)
         }
         server.onControlAPI = { [weak self] path, query in
             self?.handleControlAPI(path: path, query: query) ?? Data(#"{"ok":false}"#.utf8)
+        }
+        server.onVideoSettings = { [weak self] method, query, body in
+            self?.handleVideoSettings(method: method, query: query, body: body)
+                ?? Data(#"{"ok":false}"#.utf8)
         }
 
         publisher.onTimestampUs = { [weak self] ts in
@@ -88,6 +94,31 @@ final class BaseRuntime {
             self?.softRestart(reason: "memory-guard", detail: "footprint=\(bytes)")
         }
         MemoryGuard.shared.start()
+        InterfaceOrientationWatch.bootstrap()
+    }
+
+    private func handleVideoSettings(method: String, query: [String: String], body: Data?) -> Data {
+        if method == "GET", query.isEmpty, body == nil || body?.isEmpty == true {
+            return jsonOK(VideoSettingsStore.shared.status)
+        }
+        var patch: [String: Any] = [:]
+        if let body, !body.isEmpty,
+           let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+        {
+            patch = obj
+        }
+        for (k, v) in query { patch[k] = v }
+        let next = VideoStreamProfile.from(json: patch, current: VideoSettingsStore.shared.defaults)
+        let applied = VideoSettingsStore.shared.apply(next)
+        DispatchQueue.main.async { [weak self] in
+            self?.publisher.applyDefaultsFromSettings()
+            self?.notify("画质已更新 · \(applied.frameRate)fps · \(applied.bitrateBps / 1000)kbps")
+        }
+        var out = applied.json
+        out["ok"] = true
+        out["generation"] = VideoSettingsStore.shared.status["generation"] as Any
+        out["protocol"] = "phonebase-video-settings"
+        return (try? JSONSerialization.data(withJSONObject: out)) ?? Data(#"{"ok":true}"#.utf8)
     }
 
     /// 对齐官方 soft restart：重建 capture/encoder，WS 不断
@@ -230,33 +261,13 @@ final class BaseRuntime {
     }
 
     private func publishCurrentOrientation() {
-        let next = currentDeviceOrientationRaw()
+        // FBS 跟前台 App 界面朝向；无则 UIDevice（巨魔环境默认有 FBS）
+        let next = InterfaceOrientationWatch.currentRaw(fallbackLast: lastPublishedOrientation)
         guard next != lastPublishedOrientation else { return }
         lastPublishedOrientation = next
         controlHub.publishOrientation(next)
         geometryRevision += 1
         NSLog("[Runtime] orientation=%d", next)
-    }
-
-    /// 跟手机物理朝向 → UIInterfaceOrientation raw（1/2 竖，3/4 横）。
-    /// 不用本 App 的 windowScene：基座在后台时 scene 一直竖，换横屏 App 不会变。
-    private func currentDeviceOrientationRaw() -> Int {
-        switch UIDevice.current.orientation {
-        case .portrait: return 1
-        case .portraitUpsideDown: return 2
-        case .landscapeLeft: return 3 // → UIInterfaceOrientation.landscapeRight
-        case .landscapeRight: return 4 // → UIInterfaceOrientation.landscapeLeft
-        default:
-            break
-        }
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        if let o = scenes.first(where: { $0.activationState == .foregroundActive })?.interfaceOrientation
-            ?? scenes.first?.interfaceOrientation
-        {
-            let v = Int(o.rawValue)
-            if (1 ... 4).contains(v) { return v }
-        }
-        return lastPublishedOrientation
     }
 
     func setStreamingActive(_ active: Bool) {
@@ -270,10 +281,12 @@ final class BaseRuntime {
     private func startupMessage(retired: [String], extra: String?) -> String {
         let ips = LanAddress.ipv4List().joined(separator: ", ")
         var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)"
-        msg += "\nbuild=0.1.30-orient-poll"
+        msg += "\nbuild=0.1.31-video-orient"
         msg += "\ncapture=\(capture.backendName) encode=\(encodeW)x\(encodeH)"
         msg += "\ndeviceId=\(cachedDeviceId)"
         msg += "\nmemoryGuard=\(MemoryGuard.shared.automatic ? "on" : "off")"
+        let vs = VideoSettingsStore.shared.defaults
+        msg += "\nvideo=\(vs.frameRate)fps/\(vs.bitrateBps / 1000)kbps"
         if let extra, !extra.isEmpty { msg += "\n\(extra)" }
         if !retired.isEmpty {
             msg += "\n已结束旧版：\(retired.joined(separator: ", "))"
@@ -310,12 +323,13 @@ final class BaseRuntime {
             "keyboardAvailable": hidReady,
             "wallVideo": true,
             "licenseRequired": false,
-            "encoder": publisher.encoder.stats,
+            "encoder": publisher.encoderStats,
+            "videoSettings": VideoSettingsStore.shared.status,
             "memoryGuard": MemoryGuard.shared.status,
             "release": [
                 "product": "local",
-                "version": "0.1.30",
-                "buildId": "local-rebuild-0.1.30-orient-poll",
+                "version": "0.1.31",
+                "buildId": "local-rebuild-0.1.31-video-orient",
             ],
             "geometry": [
                 "width": w,

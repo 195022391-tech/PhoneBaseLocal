@@ -7,7 +7,9 @@ final class H264Encoder {
     private var session: VTCompressionSession?
     private let width: Int32
     private let height: Int32
-    private let queue = DispatchQueue(label: "cn.local.phonebase.local.encoder")
+    private var bitrateBps: Int
+    private var frameRate: Int
+    private let queue: DispatchQueue
     private var sentConfig = false
     private var forceNextKeyFrame = false
     private var recreateNeeded = false
@@ -29,9 +31,14 @@ final class H264Encoder {
     /// kVTInvalidSessionErr
     private static let vtInvalidSession: OSStatus = -12903
 
-    init(width: Int, height: Int) {
+    init(width: Int, height: Int, bitrateBps: Int = 6_000_000, frameRate: Int = 60) {
         self.width = Int32(max(2, width - (width % 2)))
         self.height = Int32(max(2, height - (height % 2)))
+        self.bitrateBps = max(400_000, bitrateBps)
+        self.frameRate = max(5, min(60, frameRate))
+        self.queue = DispatchQueue(
+            label: "cn.local.phonebase.local.encoder.\(width)x\(height).\(UUID().uuidString.prefix(6))"
+        )
     }
 
     var stats: [String: Any] {
@@ -39,6 +46,8 @@ final class H264Encoder {
             "ready": ready,
             "width": Int(width),
             "height": Int(height),
+            "bitrateBps": bitrateBps,
+            "frameRate": frameRate,
             "encodeAttempts": encodeAttempts,
             "encodeErrors": encodeErrors,
             "outputFrames": outputFrames,
@@ -46,6 +55,14 @@ final class H264Encoder {
             "lastCallbackStatus": Int(lastCallbackStatus),
             "sentConfig": sentConfig,
         ]
+    }
+
+    func updateRate(bitrateBps: Int, frameRate: Int) {
+        queue.async {
+            self.bitrateBps = max(400_000, bitrateBps)
+            self.frameRate = max(5, min(60, frameRate))
+            self.recreateNeeded = true
+        }
     }
 
     func forceKeyFrame() {
@@ -156,9 +173,13 @@ final class H264Encoder {
         }
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: 6_000_000 as CFNumber)
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 60 as CFNumber)
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateBps as CFNumber)
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: frameRate as CFNumber)
+        VTSessionSetProperty(
+            sess,
+            key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
+            value: max(frameRate, 15) as CFNumber
+        )
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTCompressionSessionPrepareToEncodeFrames(sess)
         session = sess
@@ -166,7 +187,7 @@ final class H264Encoder {
         forceNextKeyFrame = true
         recreateNeeded = false
         ready = true
-        NSLog("[H264] encoder ready %dx%d", width, height)
+        NSLog("[H264] encoder ready %dx%d br=%d fps=%d", width, height, bitrateBps, frameRate)
     }
 
     private func closeSessionLocked() {

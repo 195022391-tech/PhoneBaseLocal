@@ -3,6 +3,8 @@ import {
   VideoSession,
   wallProfileFromSize,
   wallProfileSticky,
+  mapPointerCoords,
+  createPointerMoveScheduler,
 } from "./player.js";
 
 const $ = (id) => document.getElementById(id);
@@ -27,6 +29,17 @@ function loadStore() {
           statusFilter: raw.prefs?.statusFilter || "all",
           sortMode: raw.prefs?.sortMode || "manual",
           devicePanelCollapsed: raw.prefs?.devicePanelCollapsed === true,
+          openWindows: Array.isArray(raw.prefs?.openWindows)
+            ? raw.prefs.openWindows
+                .filter((w) => w && w.ip)
+                .map((w) => ({
+                  ip: String(w.ip),
+                  port: Number(w.port) || 11019,
+                  name: String(w.name || w.ip),
+                  deviceId: String(w.deviceId || ""),
+                  mode: w.mode === "portrait" ? "portrait" : "landscape",
+                }))
+            : [],
         },
       };
     }
@@ -41,6 +54,7 @@ function loadStore() {
       statusFilter: "all",
       sortMode: "manual",
       devicePanelCollapsed: false,
+      openWindows: [],
     },
   };
 }
@@ -60,7 +74,10 @@ function saveStore() {
         remark: remark || "",
         phoneName: phoneName || "",
       })),
-      prefs: state.prefs,
+      prefs: {
+        ...state.prefs,
+        openWindows: Array.isArray(state.prefs.openWindows) ? state.prefs.openWindows : [],
+      },
     })
   );
 }
@@ -137,18 +154,7 @@ function updateModeStatus() {
   }
 }
 
-function filteredDevices() {
-  let list = [...state.devices];
-  const q = ($("search").value || "").trim().toLowerCase();
-  if (q) {
-    list = list.filter((d) =>
-      [d.name, d.ip, d.deviceId, d.id].some((v) => String(v || "").toLowerCase().includes(q))
-    );
-  }
-  if (state.prefs.statusFilter === "online") list = list.filter((d) => state.online.has(d.id));
-  if (state.prefs.statusFilter === "offline") list = list.filter((d) => !state.online.has(d.id));
-  if (state.prefs.tab === "online") list = list.filter((d) => state.online.has(d.id));
-
+function sortDeviceList(list) {
   const mode = state.prefs.sortMode;
   list.sort((a, b) => {
     if (mode === "name") return displayName(a).localeCompare(displayName(b), "zh");
@@ -162,6 +168,33 @@ function filteredDevices() {
     return (a.order || 0) - (b.order || 0);
   });
   return list;
+}
+
+/** 侧栏列表：可按「在线」筛选 */
+function filteredDevices() {
+  let list = [...state.devices];
+  const q = ($("search").value || "").trim().toLowerCase();
+  if (q) {
+    list = list.filter((d) =>
+      [d.name, d.ip, d.deviceId, d.id].some((v) => String(v || "").toLowerCase().includes(q))
+    );
+  }
+  if (state.prefs.statusFilter === "online") list = list.filter((d) => state.online.has(d.id));
+  if (state.prefs.statusFilter === "offline") list = list.filter((d) => !state.online.has(d.id));
+  if (state.prefs.tab === "online") list = list.filter((d) => state.online.has(d.id));
+  return sortDeviceList(list);
+}
+
+/** 设备墙：始终保留已添加设备（重启后不会因「在线」页签空窗） */
+function wallDevices() {
+  let list = [...state.devices];
+  const q = ($("search").value || "").trim().toLowerCase();
+  if (q) {
+    list = list.filter((d) =>
+      [d.name, d.ip, d.deviceId, d.id].some((v) => String(v || "").toLowerCase().includes(q))
+    );
+  }
+  return sortDeviceList(list);
 }
 
 function updateSelectionUi() {
@@ -305,7 +338,7 @@ function updateTile(tile, d) {
 function renderWall() {
   const host = $("devices");
   const empty = $("empty");
-  const list = filteredDevices();
+  const list = wallDevices();
   host.dataset.presentation = state.prefs.orientation;
   host.style.setProperty("--card-width", `${state.prefs.zoom}px`);
   document.documentElement.style.setProperty("--card-width", `${state.prefs.zoom}px`);
@@ -342,10 +375,11 @@ function renderWall() {
     if (state.online.has(d.id) && state.preview?.deviceId !== d.id) ensureTileSession(d, tile);
   }
 
+  const onlineN = [...state.online.keys()].filter((id) => list.some((d) => d.id === id)).length;
   $("summary").textContent =
     list.length === 0
-      ? "暂无设备"
-      : `显示 ${list.length} 台 · 在线 ${[...state.online.keys()].filter((id) => list.some((d) => d.id === id)).length} 台`;
+      ? "暂无设备 · 请搜索并「添加」后才会保存"
+      : `已保存 ${list.length} 台 · 在线 ${onlineN} 台`;
   updateModeStatus();
 }
 
@@ -363,6 +397,8 @@ function ensureTileSession(device, tile) {
       state.sessions.delete(device.id);
       session = null;
     } else {
+      // 墙方向切换时必须更新 presentation，否则竖屏仍按横屏旋图画
+      session.setPresentation?.(state.prefs.orientation);
       return;
     }
   }
@@ -737,7 +773,30 @@ function confirmDelete() {
   renderAll();
 }
 
+function rememberOpenWindow(device, open) {
+  const ip = String(device.ip || "");
+  const port = Number(device.port) || 11019;
+  if (!ip) return;
+  const mode = state.prefs.orientation === "portrait" ? "portrait" : "landscape";
+  const next = (state.prefs.openWindows || []).filter(
+    (w) => !(w.ip === ip && Number(w.port) === port)
+  );
+  if (open) {
+    next.push({
+      ip,
+      port,
+      name: displayName(device),
+      deviceId: String(device.deviceId || ""),
+      mode,
+    });
+  }
+  state.prefs.openWindows = next;
+  saveStore();
+}
+
 function openDeviceWindow(device) {
+  const mode = state.prefs.orientation === "portrait" ? "portrait" : "landscape";
+  rememberOpenWindow(device, true);
   window.desktopLocal?.openDeviceWindow?.({
     id: device.id,
     ip: device.ip,
@@ -745,8 +804,23 @@ function openDeviceWindow(device) {
     name: displayName(device),
     deviceId: device.deviceId,
     // 与官方一致：跟设备墙横/竖屏偏好打开独立窗
-    mode: state.prefs.orientation === "portrait" ? "portrait" : "landscape",
+    mode,
   });
+}
+
+function restoreOpenWindows() {
+  const list = Array.isArray(state.prefs.openWindows) ? [...state.prefs.openWindows] : [];
+  for (const w of list) {
+    const saved = state.devices.find((d) => d.ip === w.ip && Number(d.port) === Number(w.port || 11019));
+    window.desktopLocal?.openDeviceWindow?.({
+      id: saved?.id,
+      ip: w.ip,
+      port: w.port || 11019,
+      name: saved ? displayName(saved) : w.name || w.ip,
+      deviceId: saved?.deviceId || w.deviceId || "",
+      mode: w.mode === "portrait" ? "portrait" : state.prefs.orientation === "portrait" ? "portrait" : "landscape",
+    });
+  }
 }
 
 function suspendTile(deviceId) {
@@ -877,30 +951,46 @@ async function openPreview(deviceId) {
   }, 1000);
 
   const bindPointer = () => {
-    const norm = (ev) => {
-      const rect = canvas.getBoundingClientRect();
-      return {
-        x: Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width)),
-        y: Math.min(1, Math.max(0, (ev.clientY - rect.top) / rect.height)),
-      };
+    const point = (ev, clamp) => {
+      const fw = control?.geometry?.width || canvas.width;
+      const fh = control?.geometry?.height || canvas.height;
+      // 预览窗仅在用户点旋转菜单时 CSS rotate；横竖切换只改壳比例，不做 De 旋转变换
+      const rot = ((Number(dlg.querySelector(".phone-shell")?.dataset.rotation || 0) % 360) + 360) % 360;
+      return mapPointerCoords(
+        canvas.getBoundingClientRect(),
+        fw,
+        fh,
+        ev.clientX,
+        ev.clientY,
+        clamp,
+        rot
+      );
     };
     let pid = null;
+    const moves = createPointerMoveScheduler((x, y) => control?.pointer?.("move", x, y));
     canvas.onpointerdown = (ev) => {
       if (!controlling || !control?.ready) return;
+      const pt = point(ev, false);
+      if (!pt) return;
+      moves.clear();
       canvas.setPointerCapture(ev.pointerId);
       pid = ev.pointerId;
-      const { x, y } = norm(ev);
-      control.pointer("down", x, y);
+      control.pointer("down", pt.x, pt.y);
+      ev.preventDefault();
     };
     canvas.onpointermove = (ev) => {
       if (pid !== ev.pointerId) return;
-      const { x, y } = norm(ev);
-      control.pointer("move", x, y);
+      const pt = point(ev, true);
+      if (!pt) return;
+      moves.move(pt.x, pt.y);
+      ev.preventDefault();
     };
     const up = (ev) => {
       if (pid !== ev.pointerId) return;
-      const { x, y } = norm(ev);
-      control.pointer("up", x, y);
+      const pt = point(ev, true);
+      moves.flush();
+      if (pt) control.pointer("up", pt.x, pt.y);
+      else moves.clear();
       pid = null;
     };
     canvas.onpointerup = up;
@@ -1067,6 +1157,9 @@ $("wall-orientation").onclick = (e) => {
   if (!btn) return;
   state.prefs.orientation = btn.dataset.wallMode;
   saveStore();
+  for (const session of state.sessions.values()) {
+    session.setPresentation?.(state.prefs.orientation);
+  }
   renderWall();
 };
 
@@ -1246,34 +1339,46 @@ const batch = {
   },
 
   bindPointer(canvas) {
-    const norm = (ev) => {
-      const rect = canvas.getBoundingClientRect();
-      return {
-        x: Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width)),
-        y: Math.min(1, Math.max(0, (ev.clientY - rect.top) / rect.height)),
-      };
-    };
+    const point = (ev, clamp) =>
+      mapPointerCoords(
+        canvas.getBoundingClientRect(),
+        canvas.width,
+        canvas.height,
+        ev.clientX,
+        ev.clientY,
+        clamp,
+        0
+      );
     const fanout = (action, x, y) => {
       for (const c of this.controls.values()) {
         if (c.ready) c.pointer(action, x, y);
       }
     };
+    this._batchMoves?.clear?.();
+    this._batchMoves = createPointerMoveScheduler((x, y) => fanout("move", x, y));
     canvas.onpointerdown = (ev) => {
       if (!this.running) return;
+      const pt = point(ev, false);
+      if (!pt) return;
+      this._batchMoves.clear();
       canvas.setPointerCapture(ev.pointerId);
       this.pointerId = ev.pointerId;
-      const { x, y } = norm(ev);
-      fanout("down", x, y);
+      fanout("down", pt.x, pt.y);
+      ev.preventDefault();
     };
     canvas.onpointermove = (ev) => {
       if (this.pointerId !== ev.pointerId) return;
-      const { x, y } = norm(ev);
-      fanout("move", x, y);
+      const pt = point(ev, true);
+      if (!pt) return;
+      this._batchMoves.move(pt.x, pt.y);
+      ev.preventDefault();
     };
     const up = (ev) => {
       if (this.pointerId !== ev.pointerId) return;
-      const { x, y } = norm(ev);
-      fanout("up", x, y);
+      const pt = point(ev, true);
+      this._batchMoves.flush();
+      if (pt) fanout("up", pt.x, pt.y);
+      else this._batchMoves.clear();
       this.pointerId = null;
     };
     canvas.onpointerup = up;
@@ -1405,6 +1510,21 @@ $("batch-apply-video").onclick = async () => {
     const d = state.devices.find((x) => x.id === id);
     if (!d) continue;
     d.wallOverride = { profile: "wall", maxDimension, frameRate, lowUsage: false };
+    // 对齐官方：下发 /api/video-settings（默认档）+ 墙流 WS query
+    try {
+      await fetch(`http://${d.ip}:${d.port || 11019}/api/video-settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          frameRate,
+          bitrateMbps: bitrate,
+          maxDimension,
+          profile: "wall",
+        }),
+      });
+    } catch {
+      /* 旧包无路由时仍靠 wall query */
+    }
     const session = state.sessions.get(id);
     const tile = $("devices").querySelector(`[data-id="${id}"]`);
     if (session && state.online.has(id)) {
@@ -1417,7 +1537,7 @@ $("batch-apply-video").onclick = async () => {
   }
   $("batch-apply-video").disabled = false;
   $("batch-operation-status").textContent =
-    `已对 ${ok} 台应用设备墙画质（${maxDimension}p · ${frameRate} fps）。本地基座不支持远端码率接口，码率按档映射分辨率。`;
+    `已对 ${ok} 台应用设备墙画质（${maxDimension}p · ${frameRate} fps · ${bitrate}Mbps）。`;
 };
 
 $("close-preview").onclick = () => {
@@ -1446,7 +1566,7 @@ $("rotation-preview-menu").onclick = (e) => {
   const v = item.dataset.rotation;
   let deg = 0;
   if (v === "90") deg = 90;
-  else if (v === "-90") deg = -90;
+  else if (v === "-90") deg = 270;
   else if (v === "180") deg = 180;
   canvas.style.transform = deg ? `translate(-50%, -50%) rotate(${deg}deg)` : "translate(-50%, -50%)";
   $("rotation-preview-menu").querySelector(".rotation-menu-status").textContent = `当前 ${deg}°`;
@@ -1503,6 +1623,13 @@ $("wall-scroll").addEventListener(
   { passive: false }
 );
 
+window.desktopLocal?.onDeviceWindowClosed?.((payload) => {
+  const ip = String(payload?.ip || "");
+  const port = Number(payload?.port) || 11019;
+  if (!ip) return;
+  rememberOpenWindow({ ip, port }, false);
+});
+
 updateModeStatus();
 renderAll();
-refreshAll({ quiet: true });
+refreshAll({ quiet: true }).then(() => restoreOpenWindows());

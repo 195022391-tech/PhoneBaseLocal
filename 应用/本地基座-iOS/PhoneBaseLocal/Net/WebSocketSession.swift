@@ -33,14 +33,16 @@ final class WebSocketSession {
         queue.async { [weak self] in self?.receiveLoop() }
     }
 
-    func sendText(_ text: String) {
-        guard isOpen, let payload = text.data(using: .utf8) else { return }
-        send(frame: encodeFrame(opcode: 0x1, payload: payload))
+    @discardableResult
+    func sendText(_ text: String) -> Bool {
+        guard isOpen, let payload = text.data(using: .utf8) else { return false }
+        return send(frame: encodeFrame(opcode: 0x1, payload: payload))
     }
 
-    func sendBinary(_ data: Data) {
-        guard isOpen else { return }
-        send(frame: encodeFrame(opcode: 0x2, payload: data))
+    @discardableResult
+    func sendBinary(_ data: Data) -> Bool {
+        guard isOpen else { return false }
+        return send(frame: encodeFrame(opcode: 0x2, payload: data))
     }
 
     func close() {
@@ -55,11 +57,12 @@ final class WebSocketSession {
         onClose?()
     }
 
-    private func send(frame: Data) {
-        guard fd >= 0, isOpen, !frame.isEmpty else { return }
-        if !writeAll(frame) {
-            dropPeer()
-        }
+    @discardableResult
+    private func send(frame: Data) -> Bool {
+        guard fd >= 0, isOpen, !frame.isEmpty else { return false }
+        if writeAll(frame) { return true }
+        // 发送超时/阻塞：不立刻掐断（对齐 discardUnsent），交给上层丢帧
+        return false
     }
 
     /// Write full frame; false on timeout/error. Does not change isOpen.

@@ -20,7 +20,9 @@ final class LocalHTTPServer {
     var onHealth: (() -> Data)?
     /// path + query → JSON body；对齐官方 /api/control/*
     var onControlAPI: ((String, [String: String]) -> Data)?
-    var onVideoConnect: ((WebSocketSession) -> Void)?
+    /// GET/POST /api/video-settings；body 为 POST JSON（可空）
+    var onVideoSettings: ((String, [String: String], Data?) -> Data)?
+    var onVideoConnect: ((WebSocketSession, [String: String]) -> Void)?
     var onControlConnect: ((WebSocketSession) -> Void)?
 
     var bonjourName: String = "PhoneBaseLocal"
@@ -146,7 +148,8 @@ final class LocalHTTPServer {
                 buf.append(contentsOf: tmp.prefix(Int(n)))
                 if let range = buf.range(of: Data("\r\n\r\n".utf8)) {
                     let headerData = buf.subdata(in: buf.startIndex..<range.lowerBound)
-                    let leftover = buf.subdata(in: range.upperBound..<buf.endIndex)
+                    var leftover = buf.subdata(in: range.upperBound..<buf.endIndex)
+                    leftover = readBodyIfNeeded(fd: fd, headerData: headerData, body: leftover)
                     transferred = route(fd: fd, headerData: headerData, leftover: leftover)
                     return
                 }
@@ -165,7 +168,8 @@ final class LocalHTTPServer {
 
         if let range = buf.range(of: Data("\r\n\r\n".utf8)) {
             let headerData = buf.subdata(in: buf.startIndex..<range.lowerBound)
-            let leftover = buf.subdata(in: range.upperBound..<buf.endIndex)
+            var leftover = buf.subdata(in: range.upperBound..<buf.endIndex)
+            leftover = Self.readBodyIfNeeded(fd: fd, headerData: headerData, body: leftover)
             transferred = route(fd: fd, headerData: headerData, leftover: leftover)
             return
         }
@@ -173,6 +177,41 @@ final class LocalHTTPServer {
         // 没读到完整 HTTP：仍回一个明确 JSON，便于判断「本进程是否接到了连接」
         let json = "{\"ok\":false,\"error\":\"no-http-request\",\"peer\":\"\(peer)\",\"bytes\":\(buf.count),\"accept\":\(acceptCount)}"
         respond(fd: fd, status: 408, contentType: "application/json", body: Data(json.utf8))
+    }
+
+    private func readBodyIfNeeded(fd: Int32, headerData: Data, body: Data) -> Data {
+        Self.readBodyIfNeeded(fd: fd, headerData: headerData, body: body)
+    }
+
+    private static func contentLength(from headerData: Data) -> Int {
+        guard let header = String(data: headerData, encoding: .utf8) else { return 0 }
+        for line in header.split(separator: "\r\n") {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            if parts[0].trimmingCharacters(in: .whitespaces).lowercased() == "content-length" {
+                return max(0, Int(parts[1].trimmingCharacters(in: .whitespaces)) ?? 0)
+            }
+        }
+        return 0
+    }
+
+    private static func readBodyIfNeeded(fd: Int32, headerData: Data, body: Data) -> Data {
+        let need = contentLength(from: headerData)
+        guard need > 0, need <= 64 * 1024 else { return body }
+        var out = body
+        var tmp = [UInt8](repeating: 0, count: 4096)
+        let deadline = Date().addingTimeInterval(1.5)
+        while out.count < need, Date() < deadline {
+            let n = Darwin.recv(fd, &tmp, min(tmp.count, need - out.count), 0)
+            if n > 0 {
+                out.append(contentsOf: tmp.prefix(n))
+                continue
+            }
+            if n == 0 { break }
+            if errno == EINTR { continue }
+            break
+        }
+        return out
     }
 
     @discardableResult
@@ -198,7 +237,7 @@ final class LocalHTTPServer {
 
         let upgrade = headers["upgrade"]?.lowercased() == "websocket"
         if upgrade && (path == "/video" || path == "/control") {
-            return acceptWebSocket(fd: fd, path: path, headers: headers, leftover: leftover)
+            return acceptWebSocket(fd: fd, path: path, query: query, headers: headers, leftover: leftover)
         }
 
         if method == "GET" && path == "/api/info" {
@@ -211,6 +250,11 @@ final class LocalHTTPServer {
                         || path == "/api/control/memory-guard")
         {
             let body = onControlAPI?(path, query) ?? Data(#"{"ok":false,"error":"no-handler"}"#.utf8)
+            respond(fd: fd, status: 200, contentType: "application/json", body: body)
+        } else if (method == "GET" || method == "POST") && path == "/api/video-settings" {
+            let bodyData = leftover.isEmpty ? nil : leftover
+            let body = onVideoSettings?(method, query, bodyData)
+                ?? Data(#"{"ok":false,"error":"no-handler"}"#.utf8)
             respond(fd: fd, status: 200, contentType: "application/json", body: body)
         } else if method == "OPTIONS" {
             respond(fd: fd, status: 204, contentType: "text/plain", body: Data())
@@ -232,7 +276,13 @@ final class LocalHTTPServer {
         return out
     }
 
-    private func acceptWebSocket(fd: Int32, path: String, headers: [String: String], leftover: Data) -> Bool {
+    private func acceptWebSocket(
+        fd: Int32,
+        path: String,
+        query: [String: String],
+        headers: [String: String],
+        leftover: Data
+    ) -> Bool {
         guard let key = headers["sec-websocket-key"] else { return false }
         let accept = WebSocketHandshake.acceptKey(clientKey: key)
         let response = """
@@ -254,7 +304,11 @@ final class LocalHTTPServer {
         session.takeOwnership()
         _ = leftover
         session.start()
-        if path == "/video" { onVideoConnect?(session) } else { onControlConnect?(session) }
+        if path == "/video" {
+            onVideoConnect?(session, query)
+        } else {
+            onControlConnect?(session)
+        }
         return true
     }
 
