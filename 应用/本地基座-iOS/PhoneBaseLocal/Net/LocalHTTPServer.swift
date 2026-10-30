@@ -18,6 +18,8 @@ final class LocalHTTPServer {
 
     var onInfo: (() -> Data)?
     var onHealth: (() -> Data)?
+    /// path + query → JSON body；对齐官方 /api/control/*
+    var onControlAPI: ((String, [String: String]) -> Data)?
     var onVideoConnect: ((WebSocketSession) -> Void)?
     var onControlConnect: ((WebSocketSession) -> Void)?
 
@@ -181,7 +183,9 @@ final class LocalHTTPServer {
         let parts = requestLine.split(separator: " ")
         guard parts.count >= 2 else { return false }
         let method = String(parts[0])
-        let path = String(parts[1]).split(separator: "?").first.map(String.init) ?? String(parts[1])
+        let rawTarget = String(parts[1])
+        let path = rawTarget.split(separator: "?").first.map(String.init) ?? rawTarget
+        let query = Self.parseQuery(rawTarget)
 
         var headers: [String: String] = [:]
         for line in lines.dropFirst() where !line.isEmpty {
@@ -201,12 +205,31 @@ final class LocalHTTPServer {
             respond(fd: fd, status: 200, contentType: "application/json", body: onInfo?() ?? Data("{}".utf8))
         } else if method == "GET" && path == "/api/health" {
             respond(fd: fd, status: 200, contentType: "application/json", body: onHealth?() ?? Data("{}".utf8))
+        } else if (method == "GET" || method == "POST")
+                    && (path == "/api/control/stop"
+                        || path == "/api/control/restart"
+                        || path == "/api/control/memory-guard")
+        {
+            let body = onControlAPI?(path, query) ?? Data(#"{"ok":false,"error":"no-handler"}"#.utf8)
+            respond(fd: fd, status: 200, contentType: "application/json", body: body)
         } else if method == "OPTIONS" {
             respond(fd: fd, status: 204, contentType: "text/plain", body: Data())
         } else {
             respond(fd: fd, status: 404, contentType: "text/plain", body: Data("not found".utf8))
         }
         return false
+    }
+
+    private static func parseQuery(_ target: String) -> [String: String] {
+        guard let q = target.split(separator: "?").dropFirst().first else { return [:] }
+        var out: [String: String] = [:]
+        for pair in q.split(separator: "&") {
+            let kv = pair.split(separator: "=", maxSplits: 1)
+            guard let k = kv.first.map(String.init), !k.isEmpty else { continue }
+            let v = kv.count > 1 ? String(kv[1]) : "1"
+            out[k] = v.removingPercentEncoding ?? v
+        }
+        return out
     }
 
     private func acceptWebSocket(fd: Int32, path: String, headers: [String: String], leftover: Data) -> Bool {

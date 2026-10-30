@@ -68,6 +68,16 @@ final class FramePublisher {
         encoder.forceKeyFrame()
     }
 
+    /// memory-guard 软重启：重建 VT 会话，不断 WS
+    func recycleEncoder(reason: String) {
+        NSLog("[Publisher] recycleEncoder %@", reason)
+        encoder.stop()
+        lastConfig = nil
+        try? encoder.start()
+        encoder.resetConfigFlag()
+        requestKeyframe()
+    }
+
     private func broadcastConfig(_ avcC: Data) {
         lastConfig = avcC
         let packet = PHB1.packet(flags: .configuration, timestampUs: 0, payload: avcC)

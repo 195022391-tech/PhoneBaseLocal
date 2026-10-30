@@ -3,12 +3,18 @@ import UIKit
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
-    private let runtime = BaseRuntime.shared
+    private var runtime: BaseRuntime?
 
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        // watchdog 子进程不进 UI / 不启服务；主进程崩了由它拉起
+        if ProcessWatchdog.bootstrapIfNeeded() {
+            return false
+        }
+        let runtime = BaseRuntime.shared
+        self.runtime = runtime
         let window = UIWindow(frame: UIScreen.main.bounds)
         window.rootViewController = RootViewController(runtime: runtime)
         window.makeKeyAndVisible()
@@ -21,16 +27,15 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
-        // 锁屏也保持发布端在线；靠 audio keepalive 不被挂起。
         BackgroundKeepAlive.shared.start()
-        if runtime.isRunning {
+        if let runtime, runtime.isRunning {
             runtime.setStreamingActive(true)
         }
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
         BackgroundKeepAlive.shared.start()
-        if runtime.isRunning {
+        if let runtime, runtime.isRunning {
             runtime.setStreamingActive(true)
         }
     }

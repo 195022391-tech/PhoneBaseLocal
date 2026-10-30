@@ -72,6 +72,9 @@ final class BaseRuntime {
         server.onControlConnect = { [weak self] session in
             self?.controlHub.attach(session)
         }
+        server.onControlAPI = { [weak self] path, query in
+            self?.handleControlAPI(path: path, query: query) ?? Data(#"{"ok":false}"#.utf8)
+        }
 
         publisher.onTimestampUs = { [weak self] ts in
             self?.controlHub.latestFrameTimestampUs = ts
@@ -79,6 +82,66 @@ final class BaseRuntime {
         capture.onPixelBuffer = { [weak self] buffer, pts in
             self?.publisher.encode(buffer: buffer, presentationTime: pts)
         }
+
+        MemoryGuard.shared.onOverLimit = { [weak self] bytes in
+            self?.softRestart(reason: "memory-guard", detail: "footprint=\(bytes)")
+        }
+        MemoryGuard.shared.start()
+    }
+
+    /// 对齐官方 soft restart：重建 capture/encoder，WS 不断
+    @discardableResult
+    func softRestart(reason: String, detail: String? = nil) -> Bool {
+        MemoryGuard.shared.noteRestart(reason: reason)
+        guard isRunning else {
+            let ok = start(notifyStatus: true)
+            notify("重启(\(reason)) → \(ok ? "已启动" : "失败")")
+            return ok
+        }
+        capture.stop()
+        publisher.recycleEncoder(reason: reason)
+        capture.start()
+        setStreamingActive(true)
+        publisher.requestKeyframe()
+        var msg = "已重启 · \(reason)"
+        if let detail, !detail.isEmpty { msg += " · \(detail)" }
+        notify(msg)
+        return true
+    }
+
+    private func handleControlAPI(path: String, query: [String: String]) -> Data {
+        switch path {
+        case "/api/control/stop":
+            DispatchQueue.main.async { [weak self] in self?.stop() }
+            return jsonOK(["action": "stop"])
+        case "/api/control/restart":
+            // hard=1 → exit，由 ProcessWatchdog 拉起（对齐崩溃路径）
+            if query["hard"] == "1" || query["mode"] == "hard" {
+                MemoryGuard.shared.noteRestart(reason: "control-hard")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    exit(0)
+                }
+                return jsonOK(["action": "restart", "mode": "hard"])
+            }
+            DispatchQueue.main.async { [weak self] in
+                _ = self?.softRestart(reason: "control")
+            }
+            return jsonOK(["action": "restart", "mode": "soft"])
+        case "/api/control/memory-guard":
+            if let raw = query["enabled"] {
+                let on = raw == "1" || raw.lowercased() == "true" || raw.lowercased() == "yes"
+                MemoryGuard.shared.setEnabled(on)
+            }
+            return jsonOK(MemoryGuard.shared.status)
+        default:
+            return Data(#"{"ok":false,"error":"unknown"}"#.utf8)
+        }
+    }
+
+    private func jsonOK(_ extra: [String: Any]) -> Data {
+        var body: [String: Any] = ["ok": true]
+        for (k, v) in extra { body[k] = v }
+        return (try? JSONSerialization.data(withJSONObject: body)) ?? Data(#"{"ok":true}"#.utf8)
     }
 
     @discardableResult
@@ -195,9 +258,10 @@ final class BaseRuntime {
     private func startupMessage(retired: [String], extra: String?) -> String {
         let ips = LanAddress.ipv4List().joined(separator: ", ")
         var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)"
-        msg += "\nbuild=0.1.28-orient"
+        msg += "\nbuild=0.1.29-guard"
         msg += "\ncapture=\(capture.backendName) encode=\(encodeW)x\(encodeH)"
         msg += "\ndeviceId=\(cachedDeviceId)"
+        msg += "\nmemoryGuard=\(MemoryGuard.shared.automatic ? "on" : "off")"
         if let extra, !extra.isEmpty { msg += "\n\(extra)" }
         if !retired.isEmpty {
             msg += "\n已结束旧版：\(retired.joined(separator: ", "))"
@@ -235,10 +299,11 @@ final class BaseRuntime {
             "wallVideo": true,
             "licenseRequired": false,
             "encoder": publisher.encoder.stats,
+            "memoryGuard": MemoryGuard.shared.status,
             "release": [
                 "product": "local",
-                "version": "0.1.28",
-                "buildId": "local-rebuild-0.1.28-orient",
+                "version": "0.1.29",
+                "buildId": "local-rebuild-0.1.29-guard",
             ],
             "geometry": [
                 "width": w,
