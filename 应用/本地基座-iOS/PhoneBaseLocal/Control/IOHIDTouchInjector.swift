@@ -2,15 +2,15 @@ import Foundation
 import UIKit
 import Darwin
 
-/// 通过私有 IOHID 注入触控 / 键盘 / Unicode。
-/// 事件形状对齐 tipa(TrollVNC/STHID) + WebKit HIDEventGenerator：Hand 父事件 + Finger 子事件。
+/// tipa(TrollVNC/STHID) 同款：Hand+Finger digitizer，专用队列派发，move 合并，避免堵死 /control。
 final class IOHIDTouchInjector: TouchInjector {
     private let client: OpaquePointer?
-    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "cn.local.phonebase.hid")
     private var touching = false
     private var lastX: Double = 0.5
     private var lastY: Double = 0.5
-    /// 与常见注入器一致的内建 digitizer sender
+    private var pendingMove: (Double, Double)?
+    private var moveScheduled = false
     private let senderID: UInt64 = 0x8000_0008_1731_9372
 
     private let createDigitizer: CreateDigitizerFn?
@@ -21,18 +21,18 @@ final class IOHIDTouchInjector: TouchInjector {
     private let createKeyboard: CreateKeyboardFn?
     private let createUnicode: CreateUnicodeFn?
     private let dispatch: DispatchFn?
+    private let release: ReleaseFn?
 
     let isAvailable: Bool
 
-    // IOHIDDigitizerTransducerType
     private static let transducerHand: UInt32 = 3
-    private static let transducerFinger: UInt32 = 2
-    // event mask bits
+    private static let fingerIndex: UInt32 = 1
+    private static let fingerIdentity: UInt32 = 2
     private static let digRange: UInt32 = 0x0000_0001
     private static let digTouch: UInt32 = 0x0000_0002
     private static let digPosition: UInt32 = 0x0000_0004
+    private static let digAttribute: UInt32 = 0x0000_0008
     private static let digIdentity: UInt32 = 0x0000_0020
-    // kIOHIDEventFieldDigitizerIsDisplayIntegrated = (Digitizer<<16)|25
     private static let fieldDisplayIntegrated: UInt32 = (11 << 16) | 25
 
     static func makeIfPossible() -> IOHIDTouchInjector? {
@@ -43,7 +43,6 @@ final class IOHIDTouchInjector: TouchInjector {
     private init() {
         _ = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW)
 
-        typealias CreateClientFn = @convention(c) (CFAllocator?) -> OpaquePointer?
         typealias CreateClientTypedFn = @convention(c) (CFAllocator?, UInt32) -> OpaquePointer?
 
         createDigitizer = Self.sym("IOHIDEventCreateDigitizerEvent")
@@ -54,14 +53,11 @@ final class IOHIDTouchInjector: TouchInjector {
         createKeyboard = Self.sym("IOHIDEventCreateKeyboardEvent")
         createUnicode = Self.sym("IOHIDEventCreateUnicodeEvent")
         dispatch = Self.sym("IOHIDEventSystemClientDispatchEvent")
+        release = Self.sym("CFRelease")
 
         var clientRef: OpaquePointer?
         if let createTyped: CreateClientTypedFn = Self.sym("IOHIDEventSystemClientCreate") {
-            // 部分系统为 (allocator, type)；Passive≈1
             clientRef = createTyped(kCFAllocatorDefault, 1)
-        }
-        if clientRef == nil, let createPlain: CreateClientFn = Self.sym("IOHIDEventSystemClientCreate") {
-            clientRef = createPlain(kCFAllocatorDefault)
         }
 
         let ok =
@@ -76,74 +72,123 @@ final class IOHIDTouchInjector: TouchInjector {
 
         client = clientRef
         isAvailable = ok
-        if isAvailable {
-            NSLog("[IOHID] injector ready (tipa/WebKit digitizer path)")
-        } else {
-            NSLog("[IOHID] symbols/client unavailable — fallback required")
-        }
+        NSLog(ok ? "[IOHID] ready (async queue)" : "[IOHID] unavailable")
     }
 
     func pointer(action: String, x: Double, y: Double) {
         guard isAvailable else { return }
         let nx = min(max(x, 0), 1)
         let ny = min(max(y, 0), 1)
-        lock.lock()
-        defer { lock.unlock() }
-
-        switch action {
-        case "down":
-            touching = true
-            lastX = nx
-            lastY = ny
-            postDigitizer(x: nx, y: ny, range: true, touch: true, mask: Self.digTouch | Self.digIdentity)
-        case "move":
-            guard touching else { return }
-            lastX = nx
-            lastY = ny
-            postDigitizer(x: nx, y: ny, range: true, touch: true, mask: Self.digPosition)
-        case "up", "cancel":
-            let was = touching
-            touching = false
-            if was {
-                postDigitizer(x: lastX, y: lastY, range: false, touch: false, mask: Self.digTouch | Self.digIdentity)
-            }
-        default:
-            break
+        queue.async { [weak self] in
+            self?.pointerLocked(action: action, x: nx, y: ny)
         }
     }
 
     func pressHome() {
-        // tipa: menuDown/menuUp → Consumer Menu (0x0C / 0x40)
-        postKeyboard(usagePage: 0x0C, usage: 0x40, down: true)
-        usleep(40_000)
-        postKeyboard(usagePage: 0x0C, usage: 0x40, down: false)
+        guard isAvailable else { return }
+        queue.async { [weak self] in
+            guard let self else { return }
+            // 若仍按着屏，先抬起，避免手势状态卡住
+            if self.touching {
+                self.flushMoveLocked()
+                self.postDigitizer(
+                    x: self.lastX, y: self.lastY, range: false, touch: false,
+                    mask: Self.digTouch | Self.digIdentity
+                )
+                self.touching = false
+            }
+            self.postKeyboard(usagePage: 0x0C, usage: 0x40, down: true)
+            usleep(25_000)
+            self.postKeyboard(usagePage: 0x0C, usage: 0x40, down: false)
+        }
     }
 
     func injectText(_ text: String) {
         guard isAvailable, !text.isEmpty else { return }
-        if postUnicode(text) { return }
-        for ch in text {
-            if ch == "\n" || ch == "\r" {
-                injectKey("enter")
-                continue
-            }
-            if ch == "\t" {
-                injectKey("tab")
-                continue
-            }
-            let s = String(ch)
-            if !postUnicode(s), let usage = Self.asciiUsage(ch) {
-                postKeyboard(usagePage: 0x07, usage: usage, down: true)
-                usleep(8_000)
-                postKeyboard(usagePage: 0x07, usage: usage, down: false)
-                usleep(4_000)
-            } else {
-                usleep(6_000)
+        queue.async { [weak self] in
+            guard let self else { return }
+            if self.postUnicode(text) { return }
+            for ch in text {
+                if ch == "\n" || ch == "\r" {
+                    self.injectKeyLocked("enter")
+                    continue
+                }
+                if ch == "\t" {
+                    self.injectKeyLocked("tab")
+                    continue
+                }
+                let s = String(ch)
+                if !self.postUnicode(s), let usage = Self.asciiUsage(ch) {
+                    self.postKeyboard(usagePage: 0x07, usage: usage, down: true)
+                    usleep(6_000)
+                    self.postKeyboard(usagePage: 0x07, usage: usage, down: false)
+                    usleep(3_000)
+                }
             }
         }
     }
 
     func injectKey(_ key: String) {
+        guard isAvailable else { return }
+        queue.async { [weak self] in self?.injectKeyLocked(key) }
+    }
+
+    // MARK: - queue-only
+
+    private func pointerLocked(action: String, x: Double, y: Double) {
+        switch action {
+        case "down":
+            flushMoveLocked()
+            touching = true
+            lastX = x
+            lastY = y
+            // down: Range|Touch|Identity（WebKit Began）
+            postDigitizer(
+                x: x, y: y, range: true, touch: true,
+                mask: Self.digRange | Self.digTouch | Self.digIdentity
+            )
+        case "move":
+            guard touching else { return }
+            lastX = x
+            lastY = y
+            pendingMove = (x, y)
+            scheduleMoveFlushLocked()
+        case "up", "cancel":
+            flushMoveLocked()
+            guard touching else { return }
+            touching = false
+            postDigitizer(
+                x: lastX, y: lastY, range: false, touch: false,
+                mask: Self.digRange | Self.digTouch | Self.digIdentity
+            )
+        default:
+            break
+        }
+    }
+
+    private func scheduleMoveFlushLocked() {
+        guard !moveScheduled else { return }
+        moveScheduled = true
+        // ~90Hz 上限，滑动跟手且不堵 HID
+        queue.asyncAfter(deadline: .now() + 0.011) { [weak self] in
+            guard let self else { return }
+            self.moveScheduled = false
+            self.flushMoveLocked()
+        }
+    }
+
+    private func flushMoveLocked() {
+        guard let (x, y) = pendingMove else { return }
+        pendingMove = nil
+        guard touching else { return }
+        // move: Position|Attribute（WebKit Moved；触摸位保持在 range/touch 参数）
+        postDigitizer(
+            x: x, y: y, range: true, touch: true,
+            mask: Self.digPosition | Self.digAttribute
+        )
+    }
+
+    private func injectKeyLocked(_ key: String) {
         let map: [String: (UInt32, UInt32)] = [
             "backspace": (0x07, 0x2A),
             "enter": (0x07, 0x28),
@@ -156,7 +201,7 @@ final class IOHIDTouchInjector: TouchInjector {
         ]
         guard let (page, usage) = map[key] else { return }
         postKeyboard(usagePage: page, usage: usage, down: true)
-        usleep(20_000)
+        usleep(15_000)
         postKeyboard(usagePage: page, usage: usage, down: false)
     }
 
@@ -173,50 +218,34 @@ final class IOHIDTouchInjector: TouchInjector {
         let ts = mach_absolute_time()
         let rangeI: Int32 = range ? 1 : 0
         let touchI: Int32 = touch ? 1 : 0
+        // 轻压，部分系统对 0 压忽略 move
+        let pressure: Double = touch ? 0.5 : 0
 
         guard let parent = createDigitizer(
-            kCFAllocatorDefault,
-            ts,
-            Self.transducerHand,
-            0,
-            0,
-            mask,
-            0,
-            x,
-            y,
-            0,
-            0,
-            0,
-            rangeI,
-            touchI,
-            0
+            kCFAllocatorDefault, ts,
+            Self.transducerHand, 0, 0, mask, 0,
+            0, 0, 0, 0, 0, // parent 坐标置 0（WebKit 路径）
+            rangeI, touchI, 0
         ) else { return }
 
         setInteger(parent, Self.fieldDisplayIntegrated, 1)
 
         if let finger = createFinger(
-            kCFAllocatorDefault,
-            ts,
-            1,
-            Self.transducerFinger,
-            mask,
-            x,
-            y,
-            0,
-            0,
-            0,
-            rangeI,
-            touchI,
-            0
+            kCFAllocatorDefault, ts,
+            Self.fingerIndex, Self.fingerIdentity, mask,
+            x, y, 0, pressure, 0,
+            rangeI, touchI, 0
         ) {
             setInteger(finger, Self.fieldDisplayIntegrated, 1)
             appendEvent(parent, finger, 0)
+            release?(UnsafeRawPointer(finger))
         }
 
         if let setSender {
             setSender(parent, senderID)
         }
         dispatch(client, parent)
+        release?(UnsafeRawPointer(parent))
     }
 
     private func postKeyboard(usagePage: UInt32, usage: UInt32, down: Bool) {
@@ -227,6 +256,7 @@ final class IOHIDTouchInjector: TouchInjector {
             setSender(event, senderID)
         }
         dispatch(client, event)
+        release?(UnsafeRawPointer(event))
     }
 
     @discardableResult
@@ -243,6 +273,7 @@ final class IOHIDTouchInjector: TouchInjector {
             setSender(event, senderID)
         }
         dispatch(client, event)
+        release?(UnsafeRawPointer(event))
         return true
     }
 
@@ -275,7 +306,6 @@ final class IOHIDTouchInjector: TouchInjector {
     }
 }
 
-// WebKit / IOKit 原型（无多余 Double）
 private typealias CreateDigitizerFn = @convention(c) (
     CFAllocator?, UInt64, UInt32, UInt32, UInt32, UInt32, UInt32,
     Double, Double, Double, Double, Double, Int32, Int32, UInt32
@@ -296,3 +326,4 @@ private typealias CreateUnicodeFn = @convention(c) (
     CFAllocator?, UInt64, UnsafePointer<UInt16>?, UInt16, UInt32, UInt32
 ) -> OpaquePointer?
 private typealias DispatchFn = @convention(c) (OpaquePointer?, OpaquePointer?) -> Void
+private typealias ReleaseFn = @convention(c) (UnsafeRawPointer?) -> Void

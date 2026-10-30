@@ -177,7 +177,7 @@ async function start() {
     if (!session || session.player.frames > 0) return;
     setScreen(
       "正在连接设备",
-      "已连上发布端但无画面帧。请确认手机 build=0.1.16-hid-fix，彻底杀掉旧基座后重开"
+      "已连上发布端但无画面帧。请确认手机 build=0.1.17-hid-swipe，彻底杀掉旧基座后重开"
     );
   }, 5000);
 
