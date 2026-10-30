@@ -6,9 +6,13 @@ import Darwin
 final class IOHIDTouchInjector: TouchInjector {
     private let client: OpaquePointer?
     private let queue = DispatchQueue(label: "cn.local.phonebase.hid-events", qos: .userInteractive)
+    private let moveLock = NSLock()
     private var touching = false
     private var lastX: Double = 0.5
     private var lastY: Double = 0.5
+    /// move latest-wins：滑动时只保留最新点，避免 HID 队列堆积发涩
+    private var coalescedMove: (Double, Double)?
+    private var moveDrainScheduled = false
     /// tipa fingerIdentifiers[0]
     private let fingerId: UInt32 = 2
     private let senderID: UInt64 = 0x8000_0008_1731_9371
@@ -89,8 +93,39 @@ final class IOHIDTouchInjector: TouchInjector {
         guard isAvailable else { return }
         let nx = min(max(x, 0), 1)
         let ny = min(max(y, 0), 1)
+        if action == "move" {
+            moveLock.lock()
+            coalescedMove = (nx, ny)
+            let schedule = !moveDrainScheduled
+            if schedule { moveDrainScheduled = true }
+            moveLock.unlock()
+            if schedule {
+                queue.async { [weak self] in self?.drainCoalescedMoves() }
+            }
+            return
+        }
         queue.async { [weak self] in
-            self?.pointerLocked(action: action, x: nx, y: ny)
+            guard let self else { return }
+            // down/up 前先吐出最后一次 move，避免轨迹丢尾
+            self.drainCoalescedMoves()
+            self.pointerLocked(action: action, x: nx, y: ny)
+        }
+    }
+
+    private func drainCoalescedMoves() {
+        while true {
+            moveLock.lock()
+            let next = coalescedMove
+            coalescedMove = nil
+            if next == nil {
+                moveDrainScheduled = false
+                moveLock.unlock()
+                return
+            }
+            moveLock.unlock()
+            if touching, let next {
+                pointerLocked(action: "move", x: next.0, y: next.1)
+            }
         }
     }
 
@@ -263,28 +298,17 @@ final class IOHIDTouchInjector: TouchInjector {
         return true
     }
 
-    /// tipa `_sendHIDEvent`：Retain → queue 上 SetSenderID+Dispatch → Release
+    /// tipa `_sendHIDEvent`：SetSenderID + Dispatch。
+    /// 调用方已在 hid queue 上，勿再 async（否则滑动事件双跳排队，左右滑发卡）。
     private func sendEvent(_ event: OpaquePointer) {
         guard let client, let dispatchFn else {
             releaseFn?(UnsafeRawPointer(event))
             return
         }
-        let strong: OpaquePointer
-        if let retainFn {
-            strong = OpaquePointer(retainFn(UnsafeRawPointer(event)))
-        } else {
-            strong = event
+        if let setSender {
+            setSender(event, senderID)
         }
-        let releaseFn = self.releaseFn
-        let setSender = self.setSender
-        let senderID = self.senderID
-        queue.async {
-            if let setSender {
-                setSender(strong, senderID)
-            }
-            dispatchFn(client, strong)
-            releaseFn?(UnsafeRawPointer(strong))
-        }
+        dispatchFn(client, event)
         releaseFn?(UnsafeRawPointer(event))
     }
 
