@@ -15,17 +15,27 @@ final class BaseRuntime {
     private let sampler: ScreenSampler
     private let injector: TouchInjector
     private var geometryRevision = 1
+    /// 缓存屏幕尺寸 / 名称，避免 HTTP 线程碰 UIKit
+    private let screenWidth: Int
+    private let screenHeight: Int
+    private let cachedName: String
+    private let cachedDeviceId: String
+    private let hidReady: Bool
 
     private init() {
         let size = DeviceIdentity.screenSize()
+        screenWidth = size.width
+        screenHeight = size.height
+        cachedName = DeviceIdentity.displayName
+        cachedDeviceId = DeviceIdentity.deviceId
         let encodeW = min(max(size.width, 2), 720)
         let encodeH = min(max(size.height, 2), 1280)
         publisher = FramePublisher(width: encodeW, height: encodeH)
         let inj = TouchInjectors.best()
         injector = inj
-        let hidReady = (inj as? IOHIDTouchInjector)?.isAvailable == true
+        hidReady = (inj as? IOHIDTouchInjector)?.isAvailable == true
         controlHub = ControlHub(
-            deviceId: DeviceIdentity.deviceId,
+            deviceId: cachedDeviceId,
             width: encodeW,
             height: encodeH,
             revision: geometryRevision,
@@ -35,9 +45,22 @@ final class BaseRuntime {
         )
         sampler = ScreenSampler(width: encodeW, height: encodeH)
         server = LocalHTTPServer(port: port)
+        server.bonjourName = cachedName
+        server.bonjourTXT = [
+            "protocol": "lan-phonebase",
+            "version": "1.0",
+            "deviceId": cachedDeviceId,
+            "port": String(port),
+        ]
 
         server.onInfo = { [weak self] in self?.infoJSON() ?? Data() }
-        server.onHealth = { #"{"ok":true,"protocol":"lan-phonebase","version":"1.0"}"#.data(using: .utf8)! }
+        server.onHealth = { [weak self] in
+            let n = self?.server.acceptCount ?? 0
+            return Data("{\"ok\":true,\"protocol\":\"lan-phonebase\",\"version\":\"1.0\",\"accept\":\(n)}".utf8)
+        }
+        server.onAccepted = { [weak self] count, ip in
+            self?.notify("有连接 #\(count) from \(ip)")
+        }
         server.onVideoConnect = { [weak self] session in
             self?.publisher.attach(session)
         }
@@ -54,15 +77,46 @@ final class BaseRuntime {
         // geometry in /api/info stays full screen points*scale; stream is encodeW×encodeH
     }
 
-    func start() {
-        guard !isRunning else { return }
+    @discardableResult
+    func start(notifyStatus: Bool = true) -> Bool {
+        guard !isRunning else { return true }
+        // tipa 覆盖安装后旧实例常仍存活，先结束其它 PhoneBaseLocal 再绑端口
+        let retired = PortOccupancy.retireOtherLocals()
+        if !retired.killed.isEmpty {
+            usleep(200_000)
+        }
         do {
             try server.start()
             sampler.start()
             isRunning = true
-            notify("服务已启动 · :\(port) · deviceId=\(DeviceIdentity.deviceId)")
+            if notifyStatus {
+                let ips = LanAddress.ipv4List().joined(separator: ", ")
+                var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.12-video-fix\ndeviceId=\(cachedDeviceId)"
+                if !retired.killed.isEmpty {
+                    msg += "\n已结束旧版：\(retired.killed.joined(separator: ", "))"
+                }
+                notify(msg)
+            }
+            return true
         } catch {
-            notify("启动失败: \(error.localizedDescription)")
+            // 仍失败则再清一轮冲突（含 Direct）并重试一次
+            let freed = PortOccupancy.freePort(port)
+            usleep(200_000)
+            do {
+                try server.start()
+                sampler.start()
+                isRunning = true
+                if notifyStatus {
+                    let ips = LanAddress.ipv4List().joined(separator: ", ")
+                    notify("服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.12-video-fix\n二次清理后启动 ✓\n已结束：\((retired.killed + freed.killed).joined(separator: ", "))")
+                }
+                return true
+            } catch {
+                if notifyStatus {
+                    notify("启动失败: \(error)\n请点「释放端口占用」；若仍失败请卸载 Direct/旧基座后重开")
+                }
+                return false
+            }
         }
     }
 
@@ -79,6 +133,9 @@ final class BaseRuntime {
     func setStreamingActive(_ active: Bool) {
         sampler.setActive(active)
         publisher.setPublisherOnline(active && isRunning)
+        if active && isRunning {
+            publisher.requestKeyframe()
+        }
     }
 
     private func notify(_ text: String) {
@@ -86,31 +143,33 @@ final class BaseRuntime {
     }
 
     private func infoJSON() -> Data {
-        let size = DeviceIdentity.screenSize()
+        let w = screenWidth
+        let h = screenHeight
         let body: [String: Any] = [
             "protocol": "lan-phonebase",
             "version": "1.0",
-            "deviceId": DeviceIdentity.deviceId,
-            "name": DeviceIdentity.displayName,
+            "deviceId": cachedDeviceId,
+            "name": cachedName,
+            "port": Int(port),
             "streaming": sampler.isActive,
-            "width": size.width,
-            "height": size.height,
+            "width": w,
+            "height": h,
             "controlAvailable": true,
             "homeAvailable": true,
-            "textAvailable": (injector as? IOHIDTouchInjector)?.isAvailable == true,
-            "keyboardAvailable": (injector as? IOHIDTouchInjector)?.isAvailable == true,
+            "textAvailable": hidReady,
+            "keyboardAvailable": hidReady,
             "wallVideo": true,
             "licenseRequired": false,
             "release": [
                 "product": "local",
-                "version": "0.1.0",
-                "buildId": "local-rebuild-0.1.0",
+                "version": "0.1.12",
+                "buildId": "local-rebuild-0.1.12-video-fix",
             ],
             "geometry": [
-                "width": size.width,
-                "height": size.height,
-                "sourceWidth": size.width,
-                "sourceHeight": size.height,
+                "width": w,
+                "height": h,
+                "sourceWidth": w,
+                "sourceHeight": h,
                 "orientation": 1,
                 "revision": geometryRevision,
                 "changedAtUs": Int(Date().timeIntervalSince1970 * 1_000_000),

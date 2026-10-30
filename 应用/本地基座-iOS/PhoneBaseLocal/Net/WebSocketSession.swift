@@ -1,22 +1,36 @@
 import Foundation
-import Network
+import Darwin
 
 final class WebSocketSession {
-    private let connection: NWConnection
+    private var fd: Int32
+    /// 每条 WS 独立队列，绝不能占用 HTTP 处理队列（否则会堵死 /api/info）
     private let queue: DispatchQueue
     private var buffer = Data()
+    private var ownsFd = true
     var onText: ((String) -> Void)?
     var onBinary: ((Data) -> Void)?
     var onClose: (() -> Void)?
     private(set) var isOpen = true
 
-    init(connection: NWConnection, queue: DispatchQueue) {
-        self.connection = connection
-        self.queue = queue
+    init(socketFd: Int32, queue _: DispatchQueue? = nil) {
+        self.fd = socketFd
+        self.queue = DispatchQueue(label: "cn.local.phonebase.ws.\(socketFd)-\(UUID().uuidString)")
+        var yes: Int32 = 1
+        setsockopt(socketFd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
+        // Non-blocking: a slow/dead viewer must not stall VT encode callbacks.
+        let flags = fcntl(socketFd, F_GETFL)
+        if flags >= 0 { _ = fcntl(socketFd, F_SETFL, flags | O_NONBLOCK) }
+    }
+
+    /// 标记 fd 已移交，调用方不要再 close
+    @discardableResult
+    func takeOwnership() -> Int32 {
+        ownsFd = true
+        return fd
     }
 
     func start() {
-        receive()
+        queue.async { [weak self] in self?.receiveLoop() }
     }
 
     func sendText(_ text: String) {
@@ -33,27 +47,61 @@ final class WebSocketSession {
         guard isOpen else { return }
         isOpen = false
         send(frame: encodeFrame(opcode: 0x8, payload: Data()))
-        connection.cancel()
+        if ownsFd, fd >= 0 {
+            Darwin.close(fd)
+            fd = -1
+        }
         onClose?()
     }
 
     private func send(frame: Data) {
-        connection.send(content: frame, completion: .contentProcessed { _ in })
+        guard fd >= 0 else { return }
+        let sent = frame.withUnsafeBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return -1 }
+            return Darwin.send(fd, base, frame.count, 0)
+        }
+        // Drop peer on stall/error so broadcast cannot wedge the encoder.
+        if sent < 0 {
+            let err = errno
+            if err != EAGAIN && err != EWOULDBLOCK {
+                isOpen = false
+                if ownsFd, fd >= 0 {
+                    Darwin.close(fd)
+                    fd = -1
+                }
+                onClose?()
+            }
+        } else if sent < frame.count {
+            isOpen = false
+            if ownsFd, fd >= 0 {
+                Darwin.close(fd)
+                fd = -1
+            }
+            onClose?()
+        }
     }
 
-    private func receive() {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 1024 * 1024) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
-            if let data, !data.isEmpty {
-                self.buffer.append(data)
-                self.consumeFrames()
+    private func receiveLoop() {
+        var tmp = [UInt8](repeating: 0, count: 16 * 1024)
+        while isOpen, fd >= 0 {
+            let n = Darwin.recv(fd, &tmp, tmp.count, 0)
+            if n < 0 {
+                let err = errno
+                if err == EINTR { continue }
+                break
             }
-            if isComplete || error != nil {
-                self.isOpen = false
-                self.onClose?()
-                return
+            if n == 0 { break }
+            buffer.append(contentsOf: tmp.prefix(n))
+            consumeFrames()
+            if !isOpen { return }
+        }
+        if isOpen {
+            isOpen = false
+            if ownsFd, fd >= 0 {
+                Darwin.close(fd)
+                fd = -1
             }
-            self.receive()
+            onClose?()
         }
     }
 
@@ -94,7 +142,10 @@ final class WebSocketSession {
                 onBinary?(payload)
             case 0x8:
                 isOpen = false
-                connection.cancel()
+                if ownsFd, fd >= 0 {
+                    Darwin.close(fd)
+                    fd = -1
+                }
                 onClose?()
                 return
             case 0x9:

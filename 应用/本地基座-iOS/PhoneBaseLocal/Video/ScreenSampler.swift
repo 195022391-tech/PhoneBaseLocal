@@ -75,6 +75,10 @@ final class ScreenSampler {
         )
         guard let context else { return nil }
 
+        // Bitmap CTM is bottom-left; flip so UIKit/CG draw share top-left origin.
+        context.translateBy(x: 0, y: CGFloat(height))
+        context.scaleBy(x: 1, y: -1)
+
         // Demo pattern — proves PHB1 path end-to-end with Electron.
         context.setFillColor(UIColor(red: 0.08, green: 0.10, blue: 0.14, alpha: 1).cgColor)
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))

@@ -10,7 +10,8 @@ final class FramePublisher {
     var onTimestampUs: ((UInt64) -> Void)?
 
     init(width: Int, height: Int) {
-        encoder = H264Encoder(width: min(width, 1280), height: min(height, 720))
+        // Must match ScreenSampler / CVPixelBuffer size (portrait 720×1280 etc).
+        encoder = H264Encoder(width: width, height: height)
         encoder.onConfig = { [weak self] avcC in
             self?.broadcastConfig(avcC)
         }
@@ -25,10 +26,12 @@ final class FramePublisher {
         sessions.append(session)
         lock.unlock()
         session.sendText(#"{"type":"publisher","online":true}"#)
+        // Send cached avcC once; do not resetConfigFlag here — a second config
+        // mid-WebCodecs configure aborts the decoder and drops the following IDR.
         if let lastConfig {
             session.sendBinary(PHB1.packet(flags: .configuration, timestampUs: 0, payload: lastConfig))
-            encoder.resetConfigFlag()
         }
+        requestKeyframe()
         session.onClose = { [weak self, weak session] in
             guard let self, let session else { return }
             self.lock.lock()
@@ -56,6 +59,10 @@ final class FramePublisher {
 
     func encode(buffer: CVPixelBuffer, presentationTime: CMTime) {
         encoder.encode(buffer: buffer, presentationTime: presentationTime)
+    }
+
+    func requestKeyframe() {
+        encoder.forceKeyFrame()
     }
 
     private func broadcastConfig(_ avcC: Data) {

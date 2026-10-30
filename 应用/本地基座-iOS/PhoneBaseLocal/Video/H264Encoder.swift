@@ -9,6 +9,7 @@ final class H264Encoder {
     private let height: Int32
     private let queue = DispatchQueue(label: "cn.local.phonebase.local.encoder")
     private var sentConfig = false
+    private var forceNextKeyFrame = false
 
     var onConfig: ((Data) -> Void)?
     var onFrame: ((_ avcc: Data, _ keyframe: Bool, _ timestampUs: UInt64) -> Void)?
@@ -16,6 +17,10 @@ final class H264Encoder {
     init(width: Int, height: Int) {
         self.width = Int32(max(2, width - (width % 2)))
         self.height = Int32(max(2, height - (height % 2)))
+    }
+
+    func forceKeyFrame() {
+        queue.async { self.forceNextKeyFrame = true }
     }
 
     func start() throws {
@@ -40,10 +45,11 @@ final class H264Encoder {
             VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
             VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: 3_000_000 as CFNumber)
             VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 30 as CFNumber)
-            VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 60 as CFNumber)
+            VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 30 as CFNumber)
             VTCompressionSessionPrepareToEncodeFrames(sess)
             self.session = sess
             self.sentConfig = false
+            self.forceNextKeyFrame = true
         }
     }
 
@@ -66,12 +72,17 @@ final class H264Encoder {
         queue.async {
             guard let session = self.session else { return }
             var flags: VTEncodeInfoFlags = []
+            var props: CFDictionary?
+            if self.forceNextKeyFrame {
+                self.forceNextKeyFrame = false
+                props = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
+            }
             VTCompressionSessionEncodeFrame(
                 session,
                 imageBuffer: buffer,
                 presentationTimeStamp: presentationTime,
                 duration: .invalid,
-                frameProperties: nil,
+                frameProperties: props,
                 sourceFrameRefcon: nil,
                 infoFlagsOut: &flags
             )
