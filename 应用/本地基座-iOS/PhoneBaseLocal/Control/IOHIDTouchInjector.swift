@@ -25,6 +25,7 @@ final class IOHIDTouchInjector: TouchInjector {
     private let setSender: SetSenderFn?
     private let createKeyboard: CreateKeyboardFn?
     private let createUnicode: CreateUnicodeFn?
+    private let createUnicodeWithQuality: CreateUnicodeQualityFn?
     private let dispatchFn: DispatchFn?
     private let retainFn: RetainFn?
     private let releaseFn: ReleaseFn?
@@ -61,7 +62,9 @@ final class IOHIDTouchInjector: TouchInjector {
         setFloat = Self.sym("IOHIDEventSetFloatValue")
         setSender = Self.sym("IOHIDEventSetSenderID")
         createKeyboard = Self.sym("IOHIDEventCreateKeyboardEvent")
+        // 同一符号两种调用约定：6 参 / 7 参(quality)；postUnicode 里依次试
         createUnicode = Self.sym("IOHIDEventCreateUnicodeEvent")
+        createUnicodeWithQuality = Self.sym("IOHIDEventCreateUnicodeEvent")
         dispatchFn = Self.sym("IOHIDEventSystemClientDispatchEvent")
         retainFn = Self.sym("CFRetain")
         releaseFn = Self.sym("CFRelease")
@@ -149,14 +152,21 @@ final class IOHIDTouchInjector: TouchInjector {
         guard isAvailable, !text.isEmpty else { return }
         queue.async { [weak self] in
             guard let self else { return }
-            // tipa/TrollVNC：ASCII 走键盘 usage；整段 Unicode 事件常被输入框忽略
+            NSLog("[IOHID] injectText len=%d", text.utf16.count)
+            // ASCII → 键盘；中文等 → UTF16LE Unicode HID（旧实现 encoding=0=UTF8 导致进不去）
             var pending = ""
             func flushPending() {
                 guard !pending.isEmpty else { return }
                 let chunk = pending
                 pending = ""
-                // Unicode HID 常建得出来但不进输入框；中文等一律剪贴板+Cmd+V
-                self.pasteViaClipboard(chunk)
+                if self.postUnicode(chunk) { return }
+                // 兜底：逐字再试 + 剪贴板粘贴
+                var ok = true
+                for ch in chunk {
+                    if !self.postUnicode(String(ch)) { ok = false }
+                    usleep(8_000)
+                }
+                if !ok { self.pasteViaClipboard(chunk) }
             }
             for ch in text {
                 if ch == "\n" || ch == "\r" {
@@ -190,20 +200,20 @@ final class IOHIDTouchInjector: TouchInjector {
         usleep(3_000)
     }
 
-    /// 中文等：剪贴板 + Cmd+V（HID LeftGUI+V）
+    /// 剪贴板 + Cmd+V（Unicode 失败时兜底）
     private func pasteViaClipboard(_ text: String) {
         DispatchQueue.main.sync {
             UIPasteboard.general.string = text
         }
-        usleep(30_000)
+        usleep(40_000)
         postKeyboard(usagePage: 0x07, usage: 0xE3, down: true)
-        usleep(8_000)
+        usleep(12_000)
         postKeyboard(usagePage: 0x07, usage: 0x19, down: true)
-        usleep(20_000)
+        usleep(30_000)
         postKeyboard(usagePage: 0x07, usage: 0x19, down: false)
-        usleep(8_000)
+        usleep(12_000)
         postKeyboard(usagePage: 0x07, usage: 0xE3, down: false)
-        usleep(20_000)
+        usleep(30_000)
     }
 
     func injectKey(_ key: String) {
@@ -308,16 +318,39 @@ final class IOHIDTouchInjector: TouchInjector {
         sendEvent(event)
     }
 
+    /// IOHIDEvent::unicodeEvent — payload + byte length + encoding(UTF16LE=1) + quality + options
     @discardableResult
     private func postUnicode(_ text: String) -> Bool {
-        guard let createUnicode else { return false }
-        let ts = mach_absolute_time()
         let utf16 = Array(text.utf16)
         guard !utf16.isEmpty else { return false }
-        let event = utf16.withUnsafeBufferPointer { buf -> OpaquePointer? in
-            createUnicode(kCFAllocatorDefault, ts, buf.baseAddress, UInt16(min(buf.count, Int(UInt16.max))), 0, 0)
+        let byteLen = UInt32(utf16.count * 2)
+        let encodingUTF16LE: UInt32 = 1
+        let qualityOne: Int32 = 0x10000 // IOFixed 1.0
+        let ts = mach_absolute_time()
+
+        let event: OpaquePointer? = utf16.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return nil }
+            let raw = UnsafeRawPointer(base)
+            // 用户态常见 6 参：(payload, lengthBytes, encoding=UTF16LE, options)
+            if let createUnicode,
+               let ev = createUnicode(
+                kCFAllocatorDefault, ts, raw, byteLen, encodingUTF16LE, 0
+               ) {
+                return ev
+            }
+            // 对齐内核 unicodeEvent 的 7 参（多 quality）
+            if let createUnicodeWithQuality,
+               let ev = createUnicodeWithQuality(
+                kCFAllocatorDefault, ts, raw, byteLen, encodingUTF16LE, qualityOne, 0
+               ) {
+                return ev
+            }
+            return nil
         }
-        guard let event else { return false }
+        guard let event else {
+            NSLog("[IOHID] unicode create failed len=%d", text.utf16.count)
+            return false
+        }
         sendEvent(event)
         return true
     }
@@ -394,8 +427,13 @@ private typealias SetSenderFn = @convention(c) (OpaquePointer?, UInt64) -> Void
 private typealias CreateKeyboardFn = @convention(c) (
     CFAllocator?, UInt64, UInt32, UInt32, UInt32, UInt32
 ) -> OpaquePointer?
+/// CreateUnicode(allocator, ts, payload, lengthBytes, encoding, options)
 private typealias CreateUnicodeFn = @convention(c) (
-    CFAllocator?, UInt64, UnsafePointer<UInt16>?, UInt16, UInt32, UInt32
+    CFAllocator?, UInt64, UnsafeRawPointer?, UInt32, UInt32, UInt32
+) -> OpaquePointer?
+/// CreateUnicode(..., encoding, quality IOFixed, options)
+private typealias CreateUnicodeQualityFn = @convention(c) (
+    CFAllocator?, UInt64, UnsafeRawPointer?, UInt32, UInt32, Int32, UInt32
 ) -> OpaquePointer?
 private typealias DispatchFn = @convention(c) (OpaquePointer?, OpaquePointer?) -> Void
 private typealias RetainFn = @convention(c) (UnsafeRawPointer?) -> UnsafeRawPointer
