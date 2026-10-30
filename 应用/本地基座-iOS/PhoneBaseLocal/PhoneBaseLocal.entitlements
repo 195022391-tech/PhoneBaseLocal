@@ -21,10 +21,22 @@
 	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<!-- Direct-style global display capture (CARenderServer) -->
+	<key>com.apple.QuartzCore.global-capture</key>
+	<true/>
+	<key>com.apple.QuartzCore.system-layers</key>
+	<true/>
+	<key>com.apple.QuartzCore.displayable-context</key>
+	<true/>
 	<key>com.apple.security.exception.iokit-user-client-class</key>
 	<array>
 		<string>IOHIDLibUserClient</string>
 		<string>IOHIDEventService</string>
+		<string>IOSurfaceRootUserClient</string>
+		<string>IOSurfaceAcceleratorClient</string>
+		<string>AGXDeviceUserClient</string>
+		<string>AGXSharedUserClient</string>
+		<string>AppleJPEGDriverUserClient</string>
 	</array>
 </dict>
 </plist>

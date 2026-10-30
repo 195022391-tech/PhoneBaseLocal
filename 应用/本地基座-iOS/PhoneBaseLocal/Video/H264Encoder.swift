@@ -11,12 +11,33 @@ final class H264Encoder {
     private var sentConfig = false
     private var forceNextKeyFrame = false
 
+    private(set) var ready = false
+    private(set) var encodeAttempts: Int = 0
+    private(set) var encodeErrors: Int = 0
+    private(set) var outputFrames: Int = 0
+    private(set) var lastEncodeStatus: OSStatus = 0
+    private(set) var lastCallbackStatus: OSStatus = 0
+
     var onConfig: ((Data) -> Void)?
     var onFrame: ((_ avcc: Data, _ keyframe: Bool, _ timestampUs: UInt64) -> Void)?
 
     init(width: Int, height: Int) {
         self.width = Int32(max(2, width - (width % 2)))
         self.height = Int32(max(2, height - (height % 2)))
+    }
+
+    var stats: [String: Any] {
+        [
+            "ready": ready,
+            "width": Int(width),
+            "height": Int(height),
+            "encodeAttempts": encodeAttempts,
+            "encodeErrors": encodeErrors,
+            "outputFrames": outputFrames,
+            "lastEncodeStatus": Int(lastEncodeStatus),
+            "lastCallbackStatus": Int(lastCallbackStatus),
+            "sentConfig": sentConfig,
+        ]
     }
 
     func forceKeyFrame() {
@@ -29,12 +50,8 @@ final class H264Encoder {
                 VTCompressionSessionInvalidate(old)
                 session = nil
             }
-            let attrs: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-                kCVPixelBufferWidthKey as String: Int(width),
-                kCVPixelBufferHeightKey as String: Int(height),
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
-            ]
+            ready = false
+            // nil attributes: accept caller-created BGRA buffers (pool attrs break that).
             var sess: VTCompressionSession?
             let status = VTCompressionSessionCreate(
                 allocator: kCFAllocatorDefault,
@@ -42,19 +59,20 @@ final class H264Encoder {
                 height: height,
                 codecType: kCMVideoCodecType_H264,
                 encoderSpecification: nil,
-                imageBufferAttributes: attrs as CFDictionary,
+                imageBufferAttributes: nil,
                 compressedDataAllocator: nil,
                 outputCallback: compressionCallback,
                 refcon: Unmanaged.passUnretained(self).toOpaque(),
                 compressionSessionOut: &sess
             )
             guard status == noErr, let sess else {
+                lastEncodeStatus = status
                 NSLog("[H264] VTCompressionSessionCreate failed status=%d size=%dx%d", status, width, height)
                 return
             }
             VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
             VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
-            VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: 3_000_000 as CFNumber)
+            VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: 2_500_000 as CFNumber)
             VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 20 as CFNumber)
             VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 30 as CFNumber)
             VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
@@ -62,6 +80,7 @@ final class H264Encoder {
             self.session = sess
             self.sentConfig = false
             self.forceNextKeyFrame = true
+            self.ready = true
             NSLog("[H264] encoder ready %dx%d", width, height)
         }
     }
@@ -74,6 +93,7 @@ final class H264Encoder {
             }
             session = nil
             sentConfig = false
+            ready = false
         }
     }
 
@@ -83,7 +103,12 @@ final class H264Encoder {
 
     func encode(buffer: CVPixelBuffer, presentationTime: CMTime) {
         queue.async {
-            guard let session = self.session else { return }
+            self.encodeAttempts += 1
+            guard let session = self.session else {
+                self.encodeErrors += 1
+                self.lastEncodeStatus = -1
+                return
+            }
             var flags: VTEncodeInfoFlags = []
             var props: CFDictionary?
             if self.forceNextKeyFrame {
@@ -99,10 +124,19 @@ final class H264Encoder {
                 sourceFrameRefcon: nil,
                 infoFlagsOut: &flags
             )
+            self.lastEncodeStatus = status
             if status != noErr {
-                NSLog("[H264] EncodeFrame status=%d", status)
+                self.encodeErrors += 1
+                if self.encodeErrors <= 5 || self.encodeErrors % 50 == 0 {
+                    NSLog("[H264] EncodeFrame status=%d attempts=%d", status, self.encodeAttempts)
+                }
             }
         }
+    }
+
+    fileprivate func noteCallbackStatus(_ status: OSStatus) {
+        lastCallbackStatus = status
+        if status != noErr { encodeErrors += 1 }
     }
 
     fileprivate func handle(sampleBuffer: CMSampleBuffer) {
@@ -126,9 +160,9 @@ final class H264Encoder {
               let dataPointer, length > 0
         else { return }
 
-        // Prefer NAL-based IDR detection; attachments are not always reliable.
         let avcc = Data(bytes: dataPointer, count: length)
         let key = isKeyframe || Self.avccContainsIdr(avcc)
+        outputFrames += 1
         onFrame?(avcc, key, timestampUs)
     }
 
@@ -188,7 +222,9 @@ private func compressionCallback(
     infoFlags: VTEncodeInfoFlags,
     sampleBuffer: CMSampleBuffer?
 ) {
-    guard status == noErr, let sampleBuffer, let ref = outputCallbackRefCon else { return }
+    guard let ref = outputCallbackRefCon else { return }
     let encoder = Unmanaged<H264Encoder>.fromOpaque(ref).takeUnretainedValue()
+    encoder.noteCallbackStatus(status)
+    guard status == noErr, let sampleBuffer else { return }
     encoder.handle(sampleBuffer: sampleBuffer)
 }

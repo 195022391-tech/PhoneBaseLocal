@@ -26,4 +26,11 @@ targets:
         DEVELOPMENT_TEAM: ""
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MACCATALYST: false
-    dependencies: []
+    dependencies:
+      - sdk: IOSurface.framework
+      - sdk: VideoToolbox.framework
+      - sdk: QuartzCore.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: CoreFoundation.framework
+      - sdk: UIKit.framework

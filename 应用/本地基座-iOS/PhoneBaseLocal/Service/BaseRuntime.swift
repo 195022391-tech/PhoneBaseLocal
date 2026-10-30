@@ -12,7 +12,7 @@ final class BaseRuntime {
     private let server: LocalHTTPServer
     private let publisher: FramePublisher
     private let controlHub: ControlHub
-    private let sampler: ScreenSampler
+    private let capture: DisplayCapture
     private let injector: TouchInjector
     private var geometryRevision = 1
     /// 缓存屏幕尺寸 / 名称，避免 HTTP 线程碰 UIKit
@@ -21,6 +21,8 @@ final class BaseRuntime {
     private let cachedName: String
     private let cachedDeviceId: String
     private let hidReady: Bool
+    private let encodeW: Int
+    private let encodeH: Int
 
     private init() {
         let size = DeviceIdentity.screenSize()
@@ -28,8 +30,8 @@ final class BaseRuntime {
         screenHeight = size.height
         cachedName = DeviceIdentity.displayName
         cachedDeviceId = DeviceIdentity.deviceId
-        let encodeW = min(max(size.width, 2), 720)
-        let encodeH = min(max(size.height, 2), 1280)
+        encodeW = min(max(size.width, 2), 720)
+        encodeH = min(max(size.height, 2), 1280)
         publisher = FramePublisher(width: encodeW, height: encodeH)
         let inj = TouchInjectors.best()
         injector = inj
@@ -43,7 +45,7 @@ final class BaseRuntime {
             textAvailable: hidReady,
             keyboardAvailable: hidReady
         )
-        sampler = ScreenSampler(width: encodeW, height: encodeH)
+        capture = DisplayCapture(width: encodeW, height: encodeH)
         server = LocalHTTPServer(port: port)
         server.bonjourName = cachedName
         server.bonjourTXT = [
@@ -71,45 +73,36 @@ final class BaseRuntime {
         publisher.onTimestampUs = { [weak self] ts in
             self?.controlHub.latestFrameTimestampUs = ts
         }
-        sampler.onPixelBuffer = { [weak self] buffer, pts in
+        capture.onPixelBuffer = { [weak self] buffer, pts in
             self?.publisher.encode(buffer: buffer, presentationTime: pts)
         }
-        // geometry in /api/info stays full screen points*scale; stream is encodeW×encodeH
     }
 
     @discardableResult
     func start(notifyStatus: Bool = true) -> Bool {
         guard !isRunning else { return true }
-        // tipa 覆盖安装后旧实例常仍存活，先结束其它 PhoneBaseLocal 再绑端口
         let retired = PortOccupancy.retireOtherLocals()
         if !retired.killed.isEmpty {
             usleep(200_000)
         }
         do {
             try server.start()
-            sampler.start()
+            capture.start()
             isRunning = true
             if notifyStatus {
-                let ips = LanAddress.ipv4List().joined(separator: ", ")
-                var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.14-encode\ndeviceId=\(cachedDeviceId)"
-                if !retired.killed.isEmpty {
-                    msg += "\n已结束旧版：\(retired.killed.joined(separator: ", "))"
-                }
-                notify(msg)
+                notify(startupMessage(retired: retired.killed, extra: nil))
             }
             publisher.requestKeyframe()
             return true
         } catch {
-            // 仍失败则再清一轮冲突（含 Direct）并重试一次
             let freed = PortOccupancy.freePort(port)
             usleep(200_000)
             do {
                 try server.start()
-                sampler.start()
+                capture.start()
                 isRunning = true
                 if notifyStatus {
-                    let ips = LanAddress.ipv4List().joined(separator: ", ")
-                    notify("服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.14-encode\n二次清理后启动 ✓\n已结束：\((retired.killed + freed.killed).joined(separator: ", "))")
+                    notify(startupMessage(retired: retired.killed + freed.killed, extra: "二次清理后启动 ✓"))
                 }
                 publisher.requestKeyframe()
                 return true
@@ -124,7 +117,7 @@ final class BaseRuntime {
 
     func stop() {
         guard isRunning else { return }
-        sampler.stop()
+        capture.stop()
         publisher.detachAll()
         controlHub.detachAll()
         server.stop()
@@ -133,11 +126,27 @@ final class BaseRuntime {
     }
 
     func setStreamingActive(_ active: Bool) {
-        sampler.setActive(active)
+        capture.setActive(active)
         publisher.setPublisherOnline(active && isRunning)
         if active && isRunning {
             publisher.requestKeyframe()
         }
+    }
+
+    private func startupMessage(retired: [String], extra: String?) -> String {
+        let ips = LanAddress.ipv4List().joined(separator: ", ")
+        var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)"
+        msg += "\nbuild=0.1.15-direct-capture"
+        msg += "\ncapture=\(capture.backendName) encode=\(encodeW)x\(encodeH)"
+        msg += "\ndeviceId=\(cachedDeviceId)"
+        if let extra, !extra.isEmpty { msg += "\n\(extra)" }
+        if !retired.isEmpty {
+            msg += "\n已结束旧版：\(retired.joined(separator: ", "))"
+        }
+        if !capture.lastError.isEmpty {
+            msg += "\ncaptureErr=\(capture.lastError)"
+        }
+        return msg
     }
 
     private func notify(_ text: String) {
@@ -153,7 +162,11 @@ final class BaseRuntime {
             "deviceId": cachedDeviceId,
             "name": cachedName,
             "port": Int(port),
-            "streaming": sampler.isActive,
+            "streaming": capture.isActive,
+            "captureBackend": capture.backendName,
+            "captureState": capture.isActive ? "capturing" : "idle",
+            "captureError": capture.lastError,
+            "frames": capture.renderedFrames,
             "width": w,
             "height": h,
             "controlAvailable": true,
@@ -162,10 +175,11 @@ final class BaseRuntime {
             "keyboardAvailable": hidReady,
             "wallVideo": true,
             "licenseRequired": false,
+            "encoder": publisher.encoder.stats,
             "release": [
                 "product": "local",
-                "version": "0.1.14",
-                "buildId": "local-rebuild-0.1.14-encode",
+                "version": "0.1.15",
+                "buildId": "local-rebuild-0.1.15-direct-capture",
             ],
             "geometry": [
                 "width": w,
