@@ -24,6 +24,7 @@ final class BaseRuntime {
     private let encodeW: Int
     private let encodeH: Int
     private var orientationObserver: NSObjectProtocol?
+    private var orientationPoll: DispatchSourceTimer?
     private var lastPublishedOrientation = 1
 
     private init() {
@@ -209,10 +210,18 @@ final class BaseRuntime {
         ) { [weak self] _ in
             self?.publishCurrentOrientation()
         }
+        // 后台时 orientation 通知常丢；轮询物理朝向（跟前台横屏 App，不是本 App 的 scene）
+        let poll = DispatchSource.makeTimerSource(queue: .main)
+        poll.schedule(deadline: .now() + 0.5, repeating: 0.75)
+        poll.setEventHandler { [weak self] in self?.publishCurrentOrientation() }
+        poll.resume()
+        orientationPoll = poll
         publishCurrentOrientation()
     }
 
     private func stopOrientationWatch() {
+        orientationPoll?.cancel()
+        orientationPoll = nil
         if let orientationObserver {
             NotificationCenter.default.removeObserver(orientationObserver)
             self.orientationObserver = nil
@@ -221,7 +230,7 @@ final class BaseRuntime {
     }
 
     private func publishCurrentOrientation() {
-        let next = currentInterfaceOrientationRaw()
+        let next = currentDeviceOrientationRaw()
         guard next != lastPublishedOrientation else { return }
         lastPublishedOrientation = next
         controlHub.publishOrientation(next)
@@ -229,8 +238,17 @@ final class BaseRuntime {
         NSLog("[Runtime] orientation=%d", next)
     }
 
-    /// UIInterfaceOrientation：1/2 竖屏，3/4 横屏
-    private func currentInterfaceOrientationRaw() -> Int {
+    /// 跟手机物理朝向 → UIInterfaceOrientation raw（1/2 竖，3/4 横）。
+    /// 不用本 App 的 windowScene：基座在后台时 scene 一直竖，换横屏 App 不会变。
+    private func currentDeviceOrientationRaw() -> Int {
+        switch UIDevice.current.orientation {
+        case .portrait: return 1
+        case .portraitUpsideDown: return 2
+        case .landscapeLeft: return 3 // → UIInterfaceOrientation.landscapeRight
+        case .landscapeRight: return 4 // → UIInterfaceOrientation.landscapeLeft
+        default:
+            break
+        }
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         if let o = scenes.first(where: { $0.activationState == .foregroundActive })?.interfaceOrientation
             ?? scenes.first?.interfaceOrientation
@@ -238,13 +256,7 @@ final class BaseRuntime {
             let v = Int(o.rawValue)
             if (1 ... 4).contains(v) { return v }
         }
-        switch UIDevice.current.orientation {
-        case .portrait: return 1
-        case .portraitUpsideDown: return 2
-        case .landscapeRight: return 3
-        case .landscapeLeft: return 4
-        default: return lastPublishedOrientation
-        }
+        return lastPublishedOrientation
     }
 
     func setStreamingActive(_ active: Bool) {
@@ -258,7 +270,7 @@ final class BaseRuntime {
     private func startupMessage(retired: [String], extra: String?) -> String {
         let ips = LanAddress.ipv4List().joined(separator: ", ")
         var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)"
-        msg += "\nbuild=0.1.29-guard"
+        msg += "\nbuild=0.1.30-orient-poll"
         msg += "\ncapture=\(capture.backendName) encode=\(encodeW)x\(encodeH)"
         msg += "\ndeviceId=\(cachedDeviceId)"
         msg += "\nmemoryGuard=\(MemoryGuard.shared.automatic ? "on" : "off")"
@@ -302,8 +314,8 @@ final class BaseRuntime {
             "memoryGuard": MemoryGuard.shared.status,
             "release": [
                 "product": "local",
-                "version": "0.1.29",
-                "buildId": "local-rebuild-0.1.29-guard",
+                "version": "0.1.30",
+                "buildId": "local-rebuild-0.1.30-orient-poll",
             ],
             "geometry": [
                 "width": w,

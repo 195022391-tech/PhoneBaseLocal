@@ -261,6 +261,7 @@ async function start() {
   const srcW = Number(info.geometry?.width || info.width) || 0;
   const srcH = Number(info.geometry?.height || info.height) || 0;
   if (srcW >= 2 && srcH >= 2) deviceSource = { width: srcW, height: srcH };
+  followPhoneOrientation(info.geometry);
   applyPresentation();
   const baseWs = `ws://${body.ip}:${body.port}`;
 
@@ -459,13 +460,23 @@ function bindPointer(canvas) {
   };
   canvas.onpointerdown = (ev) => {
     if (!controlling || !control?.ready) return;
-    if (ev.button === 0) focusKeyCapture();
+    // 右键 = Home（对齐 VNC/官方习惯）
+    if (ev.button === 2) {
+      ev.preventDefault();
+      pressHome();
+      return;
+    }
+    if (ev.button !== 0) return;
+    focusKeyCapture();
     const pt = point(ev, false);
     if (!pt) return;
     moves.clear();
     canvas.setPointerCapture(ev.pointerId);
     pid = ev.pointerId;
     control.pointer("down", pt.x, pt.y);
+    ev.preventDefault();
+  };
+  canvas.oncontextmenu = (ev) => {
     ev.preventDefault();
   };
   canvas.onpointermove = (ev) => {
@@ -656,9 +667,7 @@ async function maximizeToWorkArea() {
 $("win-min").onclick = () => window.desktopLocal?.windowMinimize?.();
 $("win-max").onclick = () => void maximizeToWorkArea();
 $("close-device").onclick = () => window.desktopLocal?.windowClose?.() ?? window.close();
-$("home-device").onclick = (e) => {
-  e.preventDefault();
-  e.stopPropagation();
+function pressHome() {
   if (homeBusy || !control?.ready) return;
   homeBusy = true;
   // 官方：Home 前 cancelGesture，避免触控 capture 与放大窗 fit 缠在一起卡死
@@ -670,6 +679,11 @@ $("home-device").onclick = (e) => {
         homeBusy = false;
       }, 400);
     });
+}
+$("home-device").onclick = (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  pressHome();
 };
 $("maximize-device").onclick = () => void maximizeToWorkArea();
 window.desktopLocal?.onDeviceSetMode?.((payload) => {
