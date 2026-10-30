@@ -23,6 +23,8 @@ final class BaseRuntime {
     private let hidReady: Bool
     private let encodeW: Int
     private let encodeH: Int
+    private var orientationObserver: NSObjectProtocol?
+    private var lastPublishedOrientation = 1
 
     private init() {
         let size = DeviceIdentity.screenSize()
@@ -96,6 +98,7 @@ final class BaseRuntime {
                 notify(startupMessage(retired: retired.killed, extra: nil))
             }
             publisher.requestKeyframe()
+            startOrientationWatch()
             return true
         } catch {
             let freed = PortOccupancy.freePort(port)
@@ -110,6 +113,7 @@ final class BaseRuntime {
                     notify(startupMessage(retired: retired.killed + freed.killed, extra: "二次清理后启动 ✓"))
                 }
                 publisher.requestKeyframe()
+                startOrientationWatch()
                 return true
             } catch {
                 if notifyStatus {
@@ -122,6 +126,7 @@ final class BaseRuntime {
 
     func stop() {
         guard isRunning else { return }
+        stopOrientationWatch()
         capture.stop()
         publisher.detachAll()
         controlHub.detachAll()
@@ -129,6 +134,54 @@ final class BaseRuntime {
         isRunning = false
         BackgroundKeepAlive.shared.stop()
         notify("服务已停止")
+    }
+
+    private func startOrientationWatch() {
+        stopOrientationWatch()
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        orientationObserver = NotificationCenter.default.addObserver(
+            forName: UIDevice.orientationDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.publishCurrentOrientation()
+        }
+        publishCurrentOrientation()
+    }
+
+    private func stopOrientationWatch() {
+        if let orientationObserver {
+            NotificationCenter.default.removeObserver(orientationObserver)
+            self.orientationObserver = nil
+        }
+        UIDevice.current.endGeneratingDeviceOrientationNotifications()
+    }
+
+    private func publishCurrentOrientation() {
+        let next = currentInterfaceOrientationRaw()
+        guard next != lastPublishedOrientation else { return }
+        lastPublishedOrientation = next
+        controlHub.publishOrientation(next)
+        geometryRevision += 1
+        NSLog("[Runtime] orientation=%d", next)
+    }
+
+    /// UIInterfaceOrientation：1/2 竖屏，3/4 横屏
+    private func currentInterfaceOrientationRaw() -> Int {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        if let o = scenes.first(where: { $0.activationState == .foregroundActive })?.interfaceOrientation
+            ?? scenes.first?.interfaceOrientation
+        {
+            let v = Int(o.rawValue)
+            if (1 ... 4).contains(v) { return v }
+        }
+        switch UIDevice.current.orientation {
+        case .portrait: return 1
+        case .portraitUpsideDown: return 2
+        case .landscapeRight: return 3
+        case .landscapeLeft: return 4
+        default: return lastPublishedOrientation
+        }
     }
 
     func setStreamingActive(_ active: Bool) {
@@ -142,7 +195,7 @@ final class BaseRuntime {
     private func startupMessage(retired: [String], extra: String?) -> String {
         let ips = LanAddress.ipv4List().joined(separator: ", ")
         var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)"
-        msg += "\nbuild=0.1.27-unicode"
+        msg += "\nbuild=0.1.28-orient"
         msg += "\ncapture=\(capture.backendName) encode=\(encodeW)x\(encodeH)"
         msg += "\ndeviceId=\(cachedDeviceId)"
         if let extra, !extra.isEmpty { msg += "\n\(extra)" }
@@ -184,15 +237,15 @@ final class BaseRuntime {
             "encoder": publisher.encoder.stats,
             "release": [
                 "product": "local",
-                "version": "0.1.27",
-                "buildId": "local-rebuild-0.1.27-unicode",
+                "version": "0.1.28",
+                "buildId": "local-rebuild-0.1.28-orient",
             ],
             "geometry": [
                 "width": w,
                 "height": h,
                 "sourceWidth": w,
                 "sourceHeight": h,
-                "orientation": 1,
+                "orientation": lastPublishedOrientation,
                 "revision": geometryRevision,
                 "changedAtUs": Int(Date().timeIntervalSince1970 * 1_000_000),
             ],

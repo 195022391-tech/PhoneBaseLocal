@@ -30,6 +30,87 @@ function codecFromAvcC(avcC) {
   return `avc1.${hex}`;
 }
 
+/** 官方 Ve：portrait/landscape 与帧比例不一致时旋进画面；CARenderServer 竖缓冲里的横屏内容需 270° 而非 90°（90° 会倒着） */
+export function presentationRotationFor(mode, frameW, frameH) {
+  if (mode !== "portrait" && mode !== "landscape") return 0;
+  if (!Number.isFinite(frameW) || !Number.isFinite(frameH) || frameW <= 0 || frameH <= 0 || frameW === frameH) {
+    return 0;
+  }
+  return (mode === "landscape") === frameW > frameH ? 0 : 270;
+}
+
+/**
+ * 局域网跟手：用 rAF 合并（约显示刷新率），比官方云端 30fps setTimeout 更顺；
+ * 手机端 HID 再做 latest-wins，两边都不堆积。
+ * @param {(x:number,y:number)=>void} sendMove
+ */
+export function createPointerMoveScheduler(sendMove) {
+  let pending = null;
+  let raf = 0;
+  const flush = () => {
+    raf = 0;
+    if (!pending) return;
+    const p = pending;
+    pending = null;
+    sendMove(p.x, p.y);
+  };
+  return {
+    move(x, y) {
+      pending = { x, y };
+      if (!raf) raf = requestAnimationFrame(flush);
+    },
+    flush() {
+      if (raf) {
+        cancelAnimationFrame(raf);
+        raf = 0;
+      }
+      flush();
+    },
+    clear() {
+      if (raf) {
+        cancelAnimationFrame(raf);
+        raf = 0;
+      }
+      pending = null;
+    },
+  };
+}
+
+/**
+ * 官方 De：letterbox + presentationRotation → 手机归一化坐标 0..1
+ * @param {DOMRectReadOnly|{left:number,top:number,width:number,height:number}} rect
+ */
+export function mapPointerCoords(rect, frameW, frameH, clientX, clientY, clamp = false, rotation = 0) {
+  const n = ((Number(rotation) % 360) + 360) % 360;
+  if (
+    ![rect?.left, rect?.top, rect?.width, rect?.height, frameW, frameH, clientX, clientY].every(Number.isFinite) ||
+    rect.width <= 0 ||
+    rect.height <= 0 ||
+    frameW <= 0 ||
+    frameH <= 0 ||
+    ![0, 90, 180, 270].includes(n)
+  ) {
+    return null;
+  }
+  const swap = n === 90 || n === 270;
+  const contentW = swap ? frameH : frameW;
+  const contentH = swap ? frameW : frameH;
+  const scale = Math.min(rect.width / contentW, rect.height / contentH);
+  const drawW = contentW * scale;
+  const drawH = contentH * scale;
+  const originX = rect.left + (rect.width - drawW) / 2;
+  const originY = rect.top + (rect.height - drawH) / 2;
+  let x = (clientX - originX) / drawW;
+  let y = (clientY - originY) / drawH;
+  if (!clamp && (x < 0 || x > 1 || y < 0 || y > 1)) return null;
+  x = Math.max(0, Math.min(1, x));
+  y = Math.max(0, Math.min(1, y));
+  if (n === 90) return { x: y, y: 1 - x };
+  if (n === 180) return { x: 1 - x, y: 1 - y };
+  if (n === 270) return { x: 1 - y, y: x };
+  return { x, y };
+}
+
 /**
  * 墙模式画质：按卡片 CSS 宽度选 maxDimension。
  * 低占用仍随卡片放大（384→512），避免大缩略图被 384 拉伸发糊。
@@ -90,19 +171,19 @@ export function buildVideoUrl(base, streamProfile) {
 export class Phb1Player {
   constructor(canvasEl, { onFrameTs, onFrames, onFirstFrame, onSize, onError, presentation = "original" } = {}) {
     this.canvas = canvasEl;
-    this.ctx = canvasEl.getContext("2d");
+    this.ctx = canvasEl.getContext("2d", { alpha: false, desynchronized: true });
     if (this.ctx) {
-      this.ctx.imageSmoothingEnabled = true;
-      this.ctx.imageSmoothingQuality = "high";
+      // 视频帧按像素拷贝，高品质平滑反而吃 CPU（放大窗时更明显）
+      this.ctx.imageSmoothingEnabled = false;
     }
     this.onFrameTs = onFrameTs;
     this.onFrames = onFrames;
     this.onFirstFrame = onFirstFrame;
     this.onSize = onSize;
     this.onError = onError;
-    // portrait | landscape | original — 与官方设备窗一致，方向不匹配时旋转绘制
+    // portrait | landscape | original — 与官方一致：比例不匹配时旋转绘制进 canvas
     this.presentation = presentation;
-    this.decoderPreferences = ["prefer-software", "prefer-hardware", "no-preference"];
+    this.decoderPreferences = ["prefer-hardware", "prefer-software", "no-preference"];
     this.decoderPreference = 0;
     this.decoder = null;
     this.configuration = null;
@@ -145,7 +226,10 @@ export class Phb1Player {
   }
 
   setPresentation(mode) {
-    this.presentation = mode === "landscape" || mode === "portrait" ? mode : "original";
+    const next = mode === "landscape" || mode === "portrait" ? mode : "original";
+    if (this.presentation === next) return;
+    this.presentation = next;
+    // 勿把 width/height 置 0：Chromium 会回落到默认 300×150，竖屏窗里出现横条+大块黑边
   }
 
   createDecoder() {
@@ -154,6 +238,7 @@ export class Phb1Player {
         try {
           const fw = frame.displayWidth;
           const fh = frame.displayHeight;
+          // 官方：横/竖模式与帧比例不一致时旋进 bitmap，避免仅 CSS rotate 被裁切
           const needRotate =
             (this.presentation === "landscape" && fw < fh) ||
             (this.presentation === "portrait" && fw > fh);
@@ -165,13 +250,14 @@ export class Phb1Player {
             this.canvas.height = th;
           }
           if (needRotate) {
+            // 与 presentationRotationFor 一致：270°（顺时针），避免横屏内容倒立
             this.ctx.save();
-            this.ctx.translate(tw, 0);
-            this.ctx.rotate(Math.PI / 2);
-            this.ctx.drawImage(frame, 0, 0);
+            this.ctx.translate(0, th);
+            this.ctx.rotate(-Math.PI / 2);
+            this.ctx.drawImage(frame, 0, 0, fw, fh);
             this.ctx.restore();
           } else {
-            this.ctx.drawImage(frame, 0, 0);
+            this.ctx.drawImage(frame, 0, 0, tw, th);
           }
           this.frames += 1;
           if (this.frames === 1) this.onFirstFrame?.();
@@ -292,9 +378,10 @@ export class Phb1Player {
       if (!this.configuring) this.configureDecoder(this.decoder ? this.decoderPreference + 1 : this.decoderPreference);
       return p;
     }
-    if (this.decoder.decodeQueueSize > 3) {
+    // 积压时丢帧等关键帧，勿整段重配（重配会更卡，放大全分辨率时尤甚）
+    if (this.decoder.decodeQueueSize > 2) {
       this.dropped++;
-      this.configureDecoder();
+      this.needsKeyframe = true;
       return p;
     }
     if (this.needsKeyframe && !p.keyframe) {
@@ -360,9 +447,10 @@ export function mapControlKey(domKey) {
 }
 
 export class ControlClient {
-  constructor({ url, onReady, onAck, onError }) {
+  constructor({ url, onReady, onGeometry, onAck, onError }) {
     this.url = url;
     this.onReady = onReady;
+    this.onGeometry = onGeometry;
     this.onAck = onAck;
     this.onError = onError;
     this.ws = null;
@@ -410,7 +498,8 @@ export class ControlClient {
           if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "keepalive" }));
         }, 500);
       } else if (msg.type === "geometry") {
-        this.geometry = msg.geometry;
+        this.geometry = msg.geometry || msg;
+        this.onGeometry?.(this.geometry);
       } else if (msg.type === "ack") {
         const pending = this.pendingInputs.get(msg.seq);
         if (pending) {
@@ -468,9 +557,38 @@ export class ControlClient {
     return seq;
   }
 
-  home() {
-    if (!this.ready || this.ws?.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ type: "home", seq: ++this.seq }));
+  /**
+   * 官方：cancelGesture 后发 {type:"button",button:"home",seq}，等 ack（有超时，避免放大窗卡死）。
+   * @param {{ cancelGesture?: () => void }} [opts]
+   */
+  home(opts = {}) {
+    if (!this.ready || this.ws?.readyState !== WebSocket.OPEN) return Promise.resolve(false);
+    if (this.homeAvailable === false) return Promise.resolve(false);
+    try {
+      opts.cancelGesture?.();
+    } catch {
+      /* ignore */
+    }
+    const body = { type: "button", button: "home", seq: ++this.seq };
+    return new Promise((resolve) => {
+      const entry = {
+        resolve: (msg) => resolve(msg || { ok: true }),
+        reject: () => resolve({ ok: false }),
+      };
+      this.pendingInputs.set(body.seq, entry);
+      try {
+        this.ws.send(JSON.stringify(body));
+      } catch {
+        this.pendingInputs.delete(body.seq);
+        resolve({ ok: false });
+        return;
+      }
+      setTimeout(() => {
+        if (!this.pendingInputs.has(body.seq)) return;
+        this.pendingInputs.delete(body.seq);
+        resolve({ ok: true, timedOut: true });
+      }, 1500);
+    });
   }
 
   text(value, { force = true } = {}) {
@@ -611,6 +729,10 @@ export class VideoSession {
         if (this.alive && !this.reconnecting) this.onStatus?.("画面断开");
       };
     });
+  }
+
+  setPresentation(mode) {
+    this.player.setPresentation(mode);
   }
 
   async applyProfile(next) {

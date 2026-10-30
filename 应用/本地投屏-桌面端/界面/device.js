@@ -98,6 +98,20 @@ function setPresentation(mode) {
   applyPresentation();
 }
 
+/** geometry.orientation：1/2 竖，3/4 横；用户点过旋转菜单则不抢 */
+function followPhoneOrientation(geometry) {
+  if (explicitRotation != null) return;
+  const o = Number(geometry?.orientation);
+  if (![1, 2, 3, 4, 5, 6, 7, 8].includes(o)) return;
+  const landscape = o === 3 || o === 4 || o === 7 || o === 8;
+  const next = landscape ? "landscape" : "portrait";
+  if (next === presentation) {
+    if (preferFillWorkArea) scheduleFitWindow(true);
+    return;
+  }
+  setPresentation(next);
+}
+
 /**
  * 对齐官方 Ce()：style 按未旋转 bitmap 设宽高，再用 CSS rotate；
  * 占位盒按旋转后换边 contain。宽高按同一 scale 推导，避免放大后独立 round 比例漂移导致 De 点偏。
@@ -321,7 +335,14 @@ async function start() {
         if (msg?.geometry?.width && msg?.geometry?.height) {
           deviceSource = { width: msg.geometry.width, height: msg.geometry.height };
         }
+        followPhoneOrientation(msg?.geometry);
         applyPresentation();
+      },
+      onGeometry: (geometry) => {
+        if (geometry?.width && geometry?.height) {
+          deviceSource = { width: geometry.width, height: geometry.height };
+        }
+        followPhoneOrientation(geometry);
       },
       onError: (e) => {
         $("detail-status").textContent = String(e);

@@ -5,6 +5,8 @@ final class ControlHub {
     private var width: Int
     private var height: Int
     private var revision: Int
+    /// UIInterfaceOrientation rawValue：1/2 竖，3/4 横
+    private var orientation: Int
     private let injector: TouchInjector
     private let textAvailable: Bool
     private let keyboardAvailable: Bool
@@ -17,6 +19,7 @@ final class ControlHub {
         width: Int,
         height: Int,
         revision: Int,
+        orientation: Int = 1,
         injector: TouchInjector = LogTouchInjector(),
         textAvailable: Bool = false,
         keyboardAvailable: Bool = false
@@ -25,9 +28,30 @@ final class ControlHub {
         self.width = width
         self.height = height
         self.revision = revision
+        self.orientation = orientation
         self.injector = injector
         self.textAvailable = textAvailable
         self.keyboardAvailable = keyboardAvailable
+    }
+
+    /// 手机横竖变化 → revision++ 并广播 geometry，桌面窗据此自动旋转
+    func publishOrientation(_ next: Int) {
+        guard (1 ... 8).contains(next) else { return }
+        lock.lock()
+        guard next != orientation else {
+            lock.unlock()
+            return
+        }
+        orientation = next
+        revision += 1
+        let geo = geometryDictLocked()
+        let copy = sessions
+        lock.unlock()
+        let body: [String: Any] = ["type": "geometry", "geometry": geo]
+        guard let data = try? JSONSerialization.data(withJSONObject: body),
+              let text = String(data: data, encoding: .utf8)
+        else { return }
+        copy.forEach { $0.sendText(text) }
     }
 
     func attach(_ session: WebSocketSession) {
@@ -72,12 +96,18 @@ final class ControlHub {
     }
 
     private func geometryDict() -> [String: Any] {
+        lock.lock()
+        defer { lock.unlock() }
+        return geometryDictLocked()
+    }
+
+    private func geometryDictLocked() -> [String: Any] {
         [
             "width": width,
             "height": height,
             "sourceWidth": width,
             "sourceHeight": height,
-            "orientation": 1,
+            "orientation": orientation,
             "revision": revision,
             "changedAtUs": Int(Date().timeIntervalSince1970 * 1_000_000),
         ]
