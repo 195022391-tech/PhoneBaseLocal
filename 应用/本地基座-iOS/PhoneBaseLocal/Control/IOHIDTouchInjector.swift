@@ -2,16 +2,16 @@ import Foundation
 import UIKit
 import Darwin
 
-/// 通过私有 IOHID 注入触控 / 键盘 / Unicode 文本。
-/// 需 TrollStore 等可携带 HID entitlement 的安装方式；普通企业签通常无效。
-/// API 以 `dlsym` 动态解析，避免正式 SDK 链接失败。
+/// 通过私有 IOHID 注入触控 / 键盘 / Unicode。
+/// 事件形状对齐 tipa(TrollVNC/STHID) + WebKit HIDEventGenerator：Hand 父事件 + Finger 子事件。
 final class IOHIDTouchInjector: TouchInjector {
     private let client: OpaquePointer?
     private let lock = NSLock()
     private var touching = false
     private var lastX: Double = 0.5
     private var lastY: Double = 0.5
-    private let senderID: UInt64 = 0x8000_0000_0000_1234
+    /// 与常见注入器一致的内建 digitizer sender
+    private let senderID: UInt64 = 0x8000_0008_1731_9372
 
     private let createDigitizer: CreateDigitizerFn?
     private let createFinger: CreateFingerFn?
@@ -22,8 +22,18 @@ final class IOHIDTouchInjector: TouchInjector {
     private let createUnicode: CreateUnicodeFn?
     private let dispatch: DispatchFn?
 
-    /// 符号齐全且 client 创建成功才可用。
     let isAvailable: Bool
+
+    // IOHIDDigitizerTransducerType
+    private static let transducerHand: UInt32 = 3
+    private static let transducerFinger: UInt32 = 2
+    // event mask bits
+    private static let digRange: UInt32 = 0x0000_0001
+    private static let digTouch: UInt32 = 0x0000_0002
+    private static let digPosition: UInt32 = 0x0000_0004
+    private static let digIdentity: UInt32 = 0x0000_0020
+    // kIOHIDEventFieldDigitizerIsDisplayIntegrated = (Digitizer<<16)|25
+    private static let fieldDisplayIntegrated: UInt32 = (11 << 16) | 25
 
     static func makeIfPossible() -> IOHIDTouchInjector? {
         let inj = IOHIDTouchInjector()
@@ -31,9 +41,11 @@ final class IOHIDTouchInjector: TouchInjector {
     }
 
     private init() {
-        typealias CreateClientFn = @convention(c) (CFAllocator?, UInt32) -> OpaquePointer?
+        _ = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW)
 
-        let createClient: CreateClientFn? = Self.sym("IOHIDEventSystemClientCreate")
+        typealias CreateClientFn = @convention(c) (CFAllocator?) -> OpaquePointer?
+        typealias CreateClientTypedFn = @convention(c) (CFAllocator?, UInt32) -> OpaquePointer?
+
         createDigitizer = Self.sym("IOHIDEventCreateDigitizerEvent")
         createFinger = Self.sym("IOHIDEventCreateDigitizerFingerEvent")
         appendEvent = Self.sym("IOHIDEventAppendEvent")
@@ -43,34 +55,33 @@ final class IOHIDTouchInjector: TouchInjector {
         createUnicode = Self.sym("IOHIDEventCreateUnicodeEvent")
         dispatch = Self.sym("IOHIDEventSystemClientDispatchEvent")
 
+        var clientRef: OpaquePointer?
+        if let createTyped: CreateClientTypedFn = Self.sym("IOHIDEventSystemClientCreate") {
+            // 部分系统为 (allocator, type)；Passive≈1
+            clientRef = createTyped(kCFAllocatorDefault, 1)
+        }
+        if clientRef == nil, let createPlain: CreateClientFn = Self.sym("IOHIDEventSystemClientCreate") {
+            clientRef = createPlain(kCFAllocatorDefault)
+        }
+
         let ok =
-            createClient != nil
-            && createDigitizer != nil
+            createDigitizer != nil
             && createFinger != nil
             && appendEvent != nil
             && setInteger != nil
             && createKeyboard != nil
             && createUnicode != nil
             && dispatch != nil
+            && clientRef != nil
 
-        if ok, let createClient {
-            client = createClient(kCFAllocatorDefault, 1) // kIOHIDEventSystemClientTypePassive ≈ 1
-        } else {
-            client = nil
-        }
-        isAvailable = ok && client != nil
+        client = clientRef
+        isAvailable = ok
         if isAvailable {
-            NSLog("[IOHID] injector ready")
+            NSLog("[IOHID] injector ready (tipa/WebKit digitizer path)")
         } else {
             NSLog("[IOHID] symbols/client unavailable — fallback required")
         }
     }
-
-    deinit {
-        // IOHIDEventSystemClient 无公开 Release；进程退出由系统回收。
-    }
-
-    // MARK: - TouchInjector
 
     func pointer(action: String, x: Double, y: Double) {
         guard isAvailable else { return }
@@ -84,17 +95,17 @@ final class IOHIDTouchInjector: TouchInjector {
             touching = true
             lastX = nx
             lastY = ny
-            postDigitizer(x: nx, y: ny, touching: true, moving: false)
+            postDigitizer(x: nx, y: ny, range: true, touch: true, mask: Self.digTouch | Self.digIdentity)
         case "move":
             guard touching else { return }
             lastX = nx
             lastY = ny
-            postDigitizer(x: nx, y: ny, touching: true, moving: true)
+            postDigitizer(x: nx, y: ny, range: true, touch: true, mask: Self.digPosition)
         case "up", "cancel":
             let was = touching
             touching = false
             if was {
-                postDigitizer(x: lastX, y: lastY, touching: false, moving: false)
+                postDigitizer(x: lastX, y: lastY, range: false, touch: false, mask: Self.digTouch | Self.digIdentity)
             }
         default:
             break
@@ -102,15 +113,14 @@ final class IOHIDTouchInjector: TouchInjector {
     }
 
     func pressHome() {
-        // Consumer Control · Menu/Home（0x0C / 0x40），按下再抬起
+        // tipa: menuDown/menuUp → Consumer Menu (0x0C / 0x40)
         postKeyboard(usagePage: 0x0C, usage: 0x40, down: true)
-        usleep(30_000)
+        usleep(40_000)
         postKeyboard(usagePage: 0x0C, usage: 0x40, down: false)
     }
 
     func injectText(_ text: String) {
         guard isAvailable, !text.isEmpty else { return }
-        // 优先 Unicode 事件整段注入；失败再逐字键盘（仅 ASCII）
         if postUnicode(text) { return }
         for ch in text {
             if ch == "\n" || ch == "\r" {
@@ -150,9 +160,7 @@ final class IOHIDTouchInjector: TouchInjector {
         postKeyboard(usagePage: page, usage: usage, down: false)
     }
 
-    // MARK: - HID posts
-
-    private func postDigitizer(x: Double, y: Double, touching: Bool, moving: Bool) {
+    private func postDigitizer(x: Double, y: Double, range: Bool, touch: Bool, mask: UInt32) {
         guard
             let client,
             let createDigitizer,
@@ -163,55 +171,52 @@ final class IOHIDTouchInjector: TouchInjector {
         else { return }
 
         let ts = mach_absolute_time()
-        // transducerType hand=0；eventMask 触控相关位用常见组合
-        let eventMask: UInt32 = touching ? 0x0000_003B : 0x0000_0001
-        let digitizer = createDigitizer(
-            kCFAllocatorDefault,
-            ts,
-            0, // hand
-            0, // index
-            0, // identity
-            eventMask,
-            0, // buttonMask
-            x,
-            y,
-            0, // z
-            touching ? 0.5 : 0,
-            0,
-            0,
-            touching ? 1 : 0,
-            touching ? 1 : 0,
-            0
-        )
-        guard let digitizer else { return }
+        let rangeI: Int32 = range ? 1 : 0
+        let touchI: Int32 = touch ? 1 : 0
 
-        let finger = createFinger(
+        guard let parent = createDigitizer(
             kCFAllocatorDefault,
             ts,
-            1, // index
-            2, // identity
-            eventMask,
+            Self.transducerHand,
+            0,
+            0,
+            mask,
+            0,
             x,
             y,
             0,
-            touching ? 0.5 : 0,
             0,
             0,
-            touching ? 1 : 0,
-            touching ? 1 : 0,
+            rangeI,
+            touchI,
             0
-        )
-        if let finger {
-            appendEvent(digitizer, finger)
+        ) else { return }
+
+        setInteger(parent, Self.fieldDisplayIntegrated, 1)
+
+        if let finger = createFinger(
+            kCFAllocatorDefault,
+            ts,
+            1,
+            Self.transducerFinger,
+            mask,
+            x,
+            y,
+            0,
+            0,
+            0,
+            rangeI,
+            touchI,
+            0
+        ) {
+            setInteger(finger, Self.fieldDisplayIntegrated, 1)
+            appendEvent(parent, finger, 0)
         }
 
-        // display type / built-in display — 字段值依系统版本可能需微调
-        setInteger(digitizer, 0xB0017, 1) // kIOHIDEventFieldDigitizerDisplayType 经验值
         if let setSender {
-            setSender(digitizer, senderID)
+            setSender(parent, senderID)
         }
-        _ = moving // 保留语义；系统靠 touch/range 位区分
-        dispatch(client, digitizer)
+        dispatch(client, parent)
     }
 
     private func postKeyboard(usagePage: UInt32, usage: UInt32, down: Bool) {
@@ -228,7 +233,6 @@ final class IOHIDTouchInjector: TouchInjector {
     private func postUnicode(_ text: String) -> Bool {
         guard let client, let createUnicode, let dispatch else { return false }
         let ts = mach_absolute_time()
-        // 常见原型：CreateUnicodeEvent(allocator, timeStamp, chars, length, flags, options)
         let utf16 = Array(text.utf16)
         guard !utf16.isEmpty else { return false }
         let event = utf16.withUnsafeBufferPointer { buf -> OpaquePointer? in
@@ -242,50 +246,47 @@ final class IOHIDTouchInjector: TouchInjector {
         return true
     }
 
-    // MARK: - Helpers
-
     private static func asciiUsage(_ ch: Character) -> UInt32? {
         guard let v = ch.asciiValue else { return nil }
         switch v {
-        case 0x30: return 0x27 // 0
-        case 0x31 ... 0x39: return UInt32(0x1E + (v - 0x31)) // 1-9
-        case 0x61 ... 0x7A: return UInt32(0x04 + (v - 0x61)) // a-z
-        case 0x41 ... 0x5A: return UInt32(0x04 + (v - 0x41)) // A-Z（不带 shift，部分输入框仍可收）
-        case 0x20: return 0x2C // space
-        case 0x2D: return 0x2D // -
-        case 0x3D: return 0x2E // =
-        case 0x5B: return 0x2F // [
-        case 0x5D: return 0x30 // ]
-        case 0x5C: return 0x31 // \
-        case 0x3B: return 0x33 // ;
-        case 0x27: return 0x34 // '
-        case 0x60: return 0x35 // `
-        case 0x2C: return 0x36 // ,
-        case 0x2E: return 0x37 // .
-        case 0x2F: return 0x38 // /
+        case 0x30: return 0x27
+        case 0x31 ... 0x39: return UInt32(0x1E + (v - 0x31))
+        case 0x61 ... 0x7A: return UInt32(0x04 + (v - 0x61))
+        case 0x41 ... 0x5A: return UInt32(0x04 + (v - 0x41))
+        case 0x20: return 0x2C
+        case 0x2D: return 0x2D
+        case 0x3D: return 0x2E
+        case 0x5B: return 0x2F
+        case 0x5D: return 0x30
+        case 0x5C: return 0x31
+        case 0x3B: return 0x33
+        case 0x27: return 0x34
+        case 0x60: return 0x35
+        case 0x2C: return 0x36
+        case 0x2E: return 0x37
+        case 0x2F: return 0x38
         default: return nil
         }
     }
 
     private static func sym<T>(_ name: String) -> T? {
-        guard let p = dlsym(UnsafeMutableRawPointer(bitPattern: -2), name) else { return nil } // RTLD_DEFAULT
+        guard let p = dlsym(UnsafeMutableRawPointer(bitPattern: -2), name) else { return nil }
         return unsafeBitCast(p, to: T.self)
     }
 }
 
-// MARK: - C function types（与 IOKit 私有原型对齐的常用形态）
-
+// WebKit / IOKit 原型（无多余 Double）
 private typealias CreateDigitizerFn = @convention(c) (
     CFAllocator?, UInt64, UInt32, UInt32, UInt32, UInt32, UInt32,
-    Double, Double, Double, Double, Double, Double, Int32, Int32, UInt32
+    Double, Double, Double, Double, Double, Int32, Int32, UInt32
 ) -> OpaquePointer?
 
 private typealias CreateFingerFn = @convention(c) (
     CFAllocator?, UInt64, UInt32, UInt32, UInt32,
-    Double, Double, Double, Double, Double, Double, Int32, Int32, UInt32
+    Double, Double, Double, Double, Double, Int32, Int32, UInt32
 ) -> OpaquePointer?
 
-private typealias AppendEventFn = @convention(c) (OpaquePointer?, OpaquePointer?) -> Void
+private typealias AppendEventFn = @convention(c) (OpaquePointer?, OpaquePointer?, UInt32) -> Void
 private typealias SetIntegerFn = @convention(c) (OpaquePointer?, UInt32, Int64) -> Void
 private typealias SetSenderFn = @convention(c) (OpaquePointer?, UInt64) -> Void
 private typealias CreateKeyboardFn = @convention(c) (

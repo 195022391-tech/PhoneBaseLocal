@@ -110,6 +110,7 @@ export class Phb1Player {
     this.configured = false;
     this.needsKeyframe = true;
     this.configuring = false;
+    this.pendingKey = null;
     this.generation = 0;
     this.lastTs = 0;
     this.frames = 0;
@@ -127,6 +128,7 @@ export class Phb1Player {
     this.configured = false;
     this.needsKeyframe = true;
     this.configuring = false;
+    this.pendingKey = null;
     this.decoderPreference = 0;
     this.frames = 0;
     this.dropped = 0;
@@ -225,6 +227,7 @@ export class Phb1Player {
         }
         this.configured = true;
         this.configuring = false;
+        this.flushPendingKey();
         return codec;
       } catch {
         if (gen === this.generation) this.closeDecoder();
@@ -237,8 +240,30 @@ export class Phb1Player {
     return null;
   }
 
+  flushPendingKey() {
+    const data = this.pendingKey;
+    this.pendingKey = null;
+    if (!data || !this.decoder || this.decoder.state !== "configured") return;
+    try {
+      this.decoder.decode(
+        new EncodedVideoChunk({
+          type: "key",
+          timestamp: this.lastTs || 0,
+          data,
+        })
+      );
+      this.needsKeyframe = false;
+    } catch {
+      this.needsKeyframe = true;
+    }
+  }
+
   ensureDecoder(description) {
     if (sameBytes(this.configuration, description) && this.decoder?.state === "configured") {
+      return this.codec;
+    }
+    // Same avcC already configuring — don't abort mid-flight (phone may re-send config).
+    if (sameBytes(this.configuration, description) && this.configuring) {
       return this.codec;
     }
     this.configuration = description.slice();
@@ -262,7 +287,8 @@ export class Phb1Player {
       return p;
     }
     if (this.configuring || !this.decoder || this.decoder.state !== "configured") {
-      this.dropped++;
+      if (p.keyframe) this.pendingKey = p.payload.slice();
+      else this.dropped++;
       if (!this.configuring) this.configureDecoder(this.decoder ? this.decoderPreference + 1 : this.decoderPreference);
       return p;
     }
@@ -284,7 +310,10 @@ export class Phb1Player {
           data: p.payload,
         })
       );
-      if (p.keyframe) this.needsKeyframe = false;
+      if (p.keyframe) {
+        this.needsKeyframe = false;
+        this.pendingKey = null;
+      }
     } catch {
       this.dropped++;
       this.configureDecoder(this.decoderPreference + 1);
@@ -422,7 +451,8 @@ export class ControlClient {
 
   pointer(action, x, y) {
     if (!this.ready || this.ws?.readyState !== WebSocket.OPEN || !this.geometry) return;
-    if (!this.frameTimestampUs) return;
+    // 无帧时间戳时仍下发，避免画面已出但控制被静默丢掉
+    const frameTs = this.frameTimestampUs || Date.now() * 1000;
     const seq = ++this.seq;
     this.ws.send(
       JSON.stringify({
@@ -432,7 +462,7 @@ export class ControlClient {
         x,
         y,
         geometryRevision: this.geometry.revision,
-        frameTimestampUs: this.frameTimestampUs,
+        frameTimestampUs: frameTs,
       })
     );
     return seq;

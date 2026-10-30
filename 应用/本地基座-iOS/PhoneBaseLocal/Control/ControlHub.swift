@@ -94,12 +94,13 @@ final class ControlHub {
             return
         case "pointer":
             let action = obj["action"] as? String ?? ""
-            let seq = obj["seq"] as? Int ?? 0
+            let seq = intVal(obj["seq"]) ?? 0
             if action == "cancel" {
                 ack(session, seq: seq, ok: true)
                 return
             }
-            guard let x = obj["x"] as? Double, let y = obj["y"] as? Double,
+            // JSONSerialization 数字是 NSNumber，不能 as? Double
+            guard let x = doubleVal(obj["x"]), let y = doubleVal(obj["y"]),
                   x >= 0, x <= 1, y >= 0, y <= 1
             else {
                 ack(session, seq: seq, ok: false, error: "bad coords")
@@ -108,7 +109,7 @@ final class ControlHub {
             injector.pointer(action: action, x: x, y: y)
             ack(session, seq: seq, ok: true)
         case "button":
-            let seq = obj["seq"] as? Int ?? 0
+            let seq = intVal(obj["seq"]) ?? 0
             if (obj["button"] as? String) == "home" {
                 injector.pressHome()
                 ack(session, seq: seq, ok: true)
@@ -116,11 +117,11 @@ final class ControlHub {
                 ack(session, seq: seq, ok: false, error: "unsupported button")
             }
         case "home":
-            let seq = obj["seq"] as? Int ?? 0
+            let seq = intVal(obj["seq"]) ?? 0
             injector.pressHome()
             ack(session, seq: seq, ok: true)
         case "text":
-            let seq = obj["seq"] as? Int ?? 0
+            let seq = intVal(obj["seq"]) ?? 0
             let text = obj["text"] as? String ?? ""
             guard !text.isEmpty, text.utf8.count <= 4096 else {
                 ack(session, seq: seq, ok: false, error: "bad text")
@@ -129,7 +130,7 @@ final class ControlHub {
             injector.injectText(text)
             ack(session, seq: seq, ok: true)
         case "key":
-            let seq = obj["seq"] as? Int ?? 0
+            let seq = intVal(obj["seq"]) ?? 0
             let key = obj["key"] as? String ?? ""
             let allowed: Set<String> = ["backspace", "enter", "tab", "escape", "left", "right", "up", "down"]
             guard allowed.contains(key) else {
@@ -141,6 +142,18 @@ final class ControlHub {
         default:
             break
         }
+    }
+
+    private func doubleVal(_ any: Any?) -> Double? {
+        if let d = any as? Double { return d }
+        if let n = any as? NSNumber { return n.doubleValue }
+        return nil
+    }
+
+    private func intVal(_ any: Any?) -> Int? {
+        if let i = any as? Int { return i }
+        if let n = any as? NSNumber { return n.intValue }
+        return nil
     }
 
     private func ack(_ session: WebSocketSession, seq: Int, ok: Bool, error: String? = nil) {
