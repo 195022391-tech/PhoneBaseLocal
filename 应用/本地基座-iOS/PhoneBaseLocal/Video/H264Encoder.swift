@@ -10,6 +10,7 @@ final class H264Encoder {
     private let queue = DispatchQueue(label: "cn.local.phonebase.local.encoder")
     private var sentConfig = false
     private var forceNextKeyFrame = false
+    private var recreateNeeded = false
 
     private(set) var ready = false
     private(set) var encodeAttempts: Int = 0
@@ -20,6 +21,9 @@ final class H264Encoder {
 
     var onConfig: ((Data) -> Void)?
     var onFrame: ((_ avcc: Data, _ keyframe: Bool, _ timestampUs: UInt64) -> Void)?
+
+    /// kVTInvalidSessionErr
+    private static let vtInvalidSession: OSStatus = -12903
 
     init(width: Int, height: Int) {
         self.width = Int32(max(2, width - (width % 2)))
@@ -45,76 +49,54 @@ final class H264Encoder {
     }
 
     func start() throws {
-        queue.sync {
-            if let old = session {
-                VTCompressionSessionInvalidate(old)
-                session = nil
-            }
-            ready = false
-            // nil attributes: accept caller-created BGRA buffers (pool attrs break that).
-            var sess: VTCompressionSession?
-            let status = VTCompressionSessionCreate(
-                allocator: kCFAllocatorDefault,
-                width: width,
-                height: height,
-                codecType: kCMVideoCodecType_H264,
-                encoderSpecification: nil,
-                imageBufferAttributes: nil,
-                compressedDataAllocator: nil,
-                outputCallback: compressionCallback,
-                refcon: Unmanaged.passUnretained(self).toOpaque(),
-                compressionSessionOut: &sess
-            )
-            guard status == noErr, let sess else {
-                lastEncodeStatus = status
-                NSLog("[H264] VTCompressionSessionCreate failed status=%d size=%dx%d", status, width, height)
-                return
-            }
-            VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-            VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
-            VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: 2_500_000 as CFNumber)
-            VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 20 as CFNumber)
-            VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 30 as CFNumber)
-            VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-            VTCompressionSessionPrepareToEncodeFrames(sess)
-            self.session = sess
-            self.sentConfig = false
-            self.forceNextKeyFrame = true
-            self.ready = true
-            NSLog("[H264] encoder ready %dx%d", width, height)
-        }
+        queue.sync { self.openSessionLocked() }
     }
 
     func stop() {
-        queue.sync {
-            if let session {
-                VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
-                VTCompressionSessionInvalidate(session)
-            }
-            session = nil
-            sentConfig = false
-            ready = false
-        }
+        queue.sync { self.closeSessionLocked() }
     }
 
     func resetConfigFlag() {
-        queue.async { self.sentConfig = false }
+        queue.async {
+            self.sentConfig = false
+            self.forceNextKeyFrame = true
+        }
     }
 
     func encode(buffer: CVPixelBuffer, presentationTime: CMTime) {
+        // Retain across async hop; pool may reuse otherwise.
+        CVPixelBufferRetain(buffer)
         queue.async {
+            defer { CVPixelBufferRelease(buffer) }
             self.encodeAttempts += 1
+            if self.recreateNeeded || self.session == nil {
+                self.openSessionLocked()
+            }
             guard let session = self.session else {
                 self.encodeErrors += 1
                 self.lastEncodeStatus = -1
                 return
             }
-            var flags: VTEncodeInfoFlags = []
+
+            let bw = CVPixelBufferGetWidth(buffer)
+            let bh = CVPixelBufferGetHeight(buffer)
+            if bw != Int(self.width) || bh != Int(self.height) {
+                self.encodeErrors += 1
+                self.lastEncodeStatus = -2
+                if self.encodeErrors <= 5 || self.encodeErrors % 50 == 0 {
+                    NSLog("[H264] size mismatch buf=%dx%d sess=%dx%d", bw, bh, self.width, self.height)
+                }
+                return
+            }
+
+            // Keep forcing IDR until avcC is out — otherwise viewer stays black.
             var props: CFDictionary?
-            if self.forceNextKeyFrame {
+            if self.forceNextKeyFrame || !self.sentConfig {
                 self.forceNextKeyFrame = false
                 props = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
             }
+
+            var flags: VTEncodeInfoFlags = []
             let status = VTCompressionSessionEncodeFrame(
                 session,
                 imageBuffer: buffer,
@@ -127,6 +109,10 @@ final class H264Encoder {
             self.lastEncodeStatus = status
             if status != noErr {
                 self.encodeErrors += 1
+                if status == Self.vtInvalidSession {
+                    self.recreateNeeded = true
+                    self.closeSessionLocked()
+                }
                 if self.encodeErrors <= 5 || self.encodeErrors % 50 == 0 {
                     NSLog("[H264] EncodeFrame status=%d attempts=%d", status, self.encodeAttempts)
                 }
@@ -134,25 +120,67 @@ final class H264Encoder {
         }
     }
 
+    private func openSessionLocked() {
+        closeSessionLocked()
+        var sess: VTCompressionSession?
+        let status = VTCompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            width: width,
+            height: height,
+            codecType: kCMVideoCodecType_H264,
+            encoderSpecification: nil,
+            imageBufferAttributes: nil,
+            compressedDataAllocator: nil,
+            outputCallback: compressionCallback,
+            refcon: Unmanaged.passUnretained(self).toOpaque(),
+            compressionSessionOut: &sess
+        )
+        guard status == noErr, let sess else {
+            lastEncodeStatus = status
+            ready = false
+            NSLog("[H264] VTCompressionSessionCreate failed status=%d size=%dx%d", status, width, height)
+            return
+        }
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: 2_500_000 as CFNumber)
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 20 as CFNumber)
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 30 as CFNumber)
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        VTCompressionSessionPrepareToEncodeFrames(sess)
+        session = sess
+        sentConfig = false
+        forceNextKeyFrame = true
+        recreateNeeded = false
+        ready = true
+        NSLog("[H264] encoder ready %dx%d", width, height)
+    }
+
+    private func closeSessionLocked() {
+        if let session {
+            VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+            VTCompressionSessionInvalidate(session)
+        }
+        session = nil
+        ready = false
+    }
+
     fileprivate func noteCallbackStatus(_ status: OSStatus) {
         lastCallbackStatus = status
-        if status != noErr { encodeErrors += 1 }
+        if status != noErr {
+            encodeErrors += 1
+            if status == Self.vtInvalidSession {
+                recreateNeeded = true
+            }
+        }
     }
 
     fileprivate func handle(sampleBuffer: CMSampleBuffer) {
-        // Attachments may be absent; do not drop the bitstream when they are.
         guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true) as? [[CFString: Any]]
         let isKeyframe = !(attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let timestampUs = UInt64(max(0, pts.seconds * 1_000_000))
-
-        if !sentConfig, let format = CMSampleBufferGetFormatDescription(sampleBuffer) {
-            if let avcC = Self.avcC(from: format) {
-                sentConfig = true
-                onConfig?(avcC)
-            }
-        }
 
         var length = 0
         var dataPointer: UnsafeMutablePointer<Int8>?
@@ -162,17 +190,69 @@ final class H264Encoder {
 
         let avcc = Data(bytes: dataPointer, count: length)
         let key = isKeyframe || Self.avccContainsIdr(avcc)
+
+        if !sentConfig {
+            var avcC: Data?
+            if let format = CMSampleBufferGetFormatDescription(sampleBuffer) {
+                avcC = Self.avcC(from: format)
+            }
+            if avcC == nil {
+                avcC = Self.avcC(fromAvccBitstream: avcc)
+            }
+            if let avcC {
+                sentConfig = true
+                onConfig?(avcC)
+                NSLog("[H264] avcC ready bytes=%d", avcC.count)
+            } else {
+                // Wait for a keyframe that carries SPS/PPS.
+                forceNextKeyFrame = true
+                return
+            }
+        }
+
         outputFrames += 1
         onFrame?(avcc, key, timestampUs)
     }
 
     private static func avccContainsIdr(_ data: Data) -> Bool {
+        forEachNal(data) { type, _ in type == 5 }
+    }
+
+    private static func avcC(fromAvccBitstream data: Data) -> Data? {
+        var sps: Data?
+        var pps: Data?
+        forEachNal(data) { type, nal in
+            if type == 7 { sps = nal }
+            if type == 8 { pps = nal }
+            return false
+        }
+        guard let sps, let pps, sps.count >= 4 else { return nil }
+        var out = Data()
+        out.append(1)
+        out.append(sps[1])
+        out.append(sps[2])
+        out.append(sps[3])
+        out.append(0xFF)
+        out.append(0xE1)
+        var spsLen = UInt16(sps.count).bigEndian
+        withUnsafeBytes(of: &spsLen) { out.append(contentsOf: $0) }
+        out.append(sps)
+        out.append(1)
+        var ppsLen = UInt16(pps.count).bigEndian
+        withUnsafeBytes(of: &ppsLen) { out.append(contentsOf: $0) }
+        out.append(pps)
+        return out
+    }
+
+    @discardableResult
+    private static func forEachNal(_ data: Data, _ body: (UInt8, Data) -> Bool) -> Bool {
         var i = 0
         while i + 4 <= data.count {
             let n = Int(data[i]) << 24 | Int(data[i + 1]) << 16 | Int(data[i + 2]) << 8 | Int(data[i + 3])
             i += 4
             guard n > 0, i + n <= data.count else { return false }
-            if (data[i] & 0x1f) == 5 { return true }
+            let type = data[i] & 0x1f
+            if body(type, data.subdata(in: i ..< (i + n))) { return true }
             i += n
         }
         return false
@@ -182,7 +262,6 @@ final class H264Encoder {
         var spsCount = 0
         var spsPointer: UnsafePointer<UInt8>?
         var spsSize = 0
-        var ppsCount = 0
         var ppsPointer: UnsafePointer<UInt8>?
         var ppsSize = 0
         var nalHeaderLength: Int32 = 0
@@ -193,21 +272,21 @@ final class H264Encoder {
         )
         let ppsStatus = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
             format, parameterSetIndex: 1, parameterSetPointerOut: &ppsPointer,
-            parameterSetSizeOut: &ppsSize, parameterSetCountOut: &ppsCount, nalUnitHeaderLengthOut: nil
+            parameterSetSizeOut: &ppsSize, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil
         )
-        guard spsStatus == noErr, ppsStatus == noErr, let spsPointer, let ppsPointer, nalHeaderLength == 4 else { return nil }
+        guard spsStatus == noErr, ppsStatus == noErr, let spsPointer, let ppsPointer, spsSize >= 4 else { return nil }
 
         var out = Data()
-        out.append(1) // configurationVersion
+        out.append(1)
         out.append(spsPointer[1])
         out.append(spsPointer[2])
         out.append(spsPointer[3])
-        out.append(0xFF) // lengthSizeMinusOne = 3
-        out.append(0xE1) // one SPS
+        out.append(0xFF)
+        out.append(0xE1)
         var spsLen = UInt16(spsSize).bigEndian
         withUnsafeBytes(of: &spsLen) { out.append(contentsOf: $0) }
         out.append(UnsafeBufferPointer(start: spsPointer, count: spsSize))
-        out.append(1) // one PPS
+        out.append(1)
         var ppsLen = UInt16(ppsSize).bigEndian
         withUnsafeBytes(of: &ppsLen) { out.append(contentsOf: $0) }
         out.append(UnsafeBufferPointer(start: ppsPointer, count: ppsSize))

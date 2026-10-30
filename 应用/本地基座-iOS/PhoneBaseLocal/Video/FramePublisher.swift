@@ -30,6 +30,9 @@ final class FramePublisher {
         // mid-WebCodecs configure aborts the decoder and drops the following IDR.
         if let lastConfig {
             session.sendBinary(PHB1.packet(flags: .configuration, timestampUs: 0, payload: lastConfig))
+        } else {
+            // No SPS/PPS yet: keep asking for IDR until encoder emits config.
+            encoder.resetConfigFlag()
         }
         requestKeyframe()
         session.onClose = { [weak self, weak session] in
