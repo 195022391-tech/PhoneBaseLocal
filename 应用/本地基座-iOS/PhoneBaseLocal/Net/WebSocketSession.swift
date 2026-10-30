@@ -17,9 +17,9 @@ final class WebSocketSession {
         self.queue = DispatchQueue(label: "cn.local.phonebase.ws.\(socketFd)-\(UUID().uuidString)")
         var yes: Int32 = 1
         setsockopt(socketFd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
-        // Non-blocking: a slow/dead viewer must not stall VT encode callbacks.
-        let flags = fcntl(socketFd, F_GETFL)
-        if flags >= 0 { _ = fcntl(socketFd, F_SETFL, flags | O_NONBLOCK) }
+        // Cap send stall so a dead viewer cannot wedge VT callbacks; still allow full frames.
+        var tv = timeval(tv_sec: 0, tv_usec: 250_000)
+        setsockopt(socketFd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout.size(ofValue: tv)))
     }
 
     /// 标记 fd 已移交，调用方不要再 close
@@ -45,8 +45,9 @@ final class WebSocketSession {
 
     func close() {
         guard isOpen else { return }
+        let frame = encodeFrame(opcode: 0x8, payload: Data())
         isOpen = false
-        send(frame: encodeFrame(opcode: 0x8, payload: Data()))
+        _ = writeAll(frame)
         if ownsFd, fd >= 0 {
             Darwin.close(fd)
             fd = -1
@@ -55,30 +56,38 @@ final class WebSocketSession {
     }
 
     private func send(frame: Data) {
-        guard fd >= 0 else { return }
-        let sent = frame.withUnsafeBytes { raw -> Int in
-            guard let base = raw.baseAddress else { return -1 }
-            return Darwin.send(fd, base, frame.count, 0)
+        guard fd >= 0, isOpen, !frame.isEmpty else { return }
+        if !writeAll(frame) {
+            dropPeer()
         }
-        // Drop peer on stall/error so broadcast cannot wedge the encoder.
-        if sent < 0 {
-            let err = errno
-            if err != EAGAIN && err != EWOULDBLOCK {
-                isOpen = false
-                if ownsFd, fd >= 0 {
-                    Darwin.close(fd)
-                    fd = -1
-                }
-                onClose?()
+    }
+
+    /// Write full frame; false on timeout/error. Does not change isOpen.
+    private func writeAll(_ frame: Data) -> Bool {
+        guard fd >= 0, !frame.isEmpty else { return false }
+        var offset = 0
+        while offset < frame.count {
+            let n = frame.withUnsafeBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return -1 }
+                return Darwin.send(fd, base + offset, frame.count - offset, 0)
             }
-        } else if sent < frame.count {
-            isOpen = false
-            if ownsFd, fd >= 0 {
-                Darwin.close(fd)
-                fd = -1
+            if n > 0 {
+                offset += n
+                continue
             }
-            onClose?()
+            return false
         }
+        return true
+    }
+
+    private func dropPeer() {
+        guard isOpen else { return }
+        isOpen = false
+        if ownsFd, fd >= 0 {
+            Darwin.close(fd)
+            fd = -1
+        }
+        onClose?()
     }
 
     private func receiveLoop() {

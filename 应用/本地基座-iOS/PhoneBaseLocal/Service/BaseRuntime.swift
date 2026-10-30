@@ -91,7 +91,7 @@ final class BaseRuntime {
             isRunning = true
             if notifyStatus {
                 let ips = LanAddress.ipv4List().joined(separator: ", ")
-                var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.12-video-fix\ndeviceId=\(cachedDeviceId)"
+                var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.13-ws-send\ndeviceId=\(cachedDeviceId)"
                 if !retired.killed.isEmpty {
                     msg += "\n已结束旧版：\(retired.killed.joined(separator: ", "))"
                 }
@@ -108,7 +108,7 @@ final class BaseRuntime {
                 isRunning = true
                 if notifyStatus {
                     let ips = LanAddress.ipv4List().joined(separator: ", ")
-                    notify("服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.12-video-fix\n二次清理后启动 ✓\n已结束：\((retired.killed + freed.killed).joined(separator: ", "))")
+                    notify("服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.13-ws-send\n二次清理后启动 ✓\n已结束：\((retired.killed + freed.killed).joined(separator: ", "))")
                 }
                 return true
             } catch {
@@ -162,8 +162,8 @@ final class BaseRuntime {
             "licenseRequired": false,
             "release": [
                 "product": "local",
-                "version": "0.1.12",
-                "buildId": "local-rebuild-0.1.12-video-fix",
+                "version": "0.1.13",
+                "buildId": "local-rebuild-0.1.13-ws-send",
             ],
             "geometry": [
                 "width": w,
