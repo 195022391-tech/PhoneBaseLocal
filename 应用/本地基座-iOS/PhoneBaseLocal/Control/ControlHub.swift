@@ -107,7 +107,10 @@ final class ControlHub {
                 return
             }
             injector.pointer(action: action, x: x, y: y)
-            ack(session, seq: seq, ok: true)
+            // move 高频：不 ack，少一半往返，滑动更跟手
+            if action != "move" {
+                ack(session, seq: seq, ok: true)
+            }
         case "button":
             let seq = intVal(obj["seq"]) ?? 0
             if (obj["button"] as? String) == "home" {

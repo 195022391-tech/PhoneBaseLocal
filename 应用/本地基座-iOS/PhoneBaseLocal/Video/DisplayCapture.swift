@@ -56,7 +56,8 @@ final class DisplayCapture: NSObject {
         frameIndex = 0
         lastDirty = .max
         let link = CADisplayLink(target: self, selector: #selector(tick))
-        link.preferredFramesPerSecond = 20
+        // 20fps 滑动观感必卡；对齐常见投屏 30
+        link.preferredFramesPerSecond = 30
         link.add(to: .main, forMode: .common)
         displayLink = link
         NSLog("[Capture] start backend=%@ %dx%d", backendName, width, height)
@@ -76,7 +77,7 @@ final class DisplayCapture: NSObject {
     @objc private func tick() {
         guard wantsFrames else { return }
         frameIndex += 1
-        let pts = CMTime(value: frameIndex, timescale: 20)
+        let pts = CMTime(value: frameIndex, timescale: 30)
 
         if backend == .direct, let renderDisplay {
             if shouldSkipUnchanged() { return }
