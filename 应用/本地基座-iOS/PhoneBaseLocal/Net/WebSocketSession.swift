@@ -17,9 +17,7 @@ final class WebSocketSession {
         self.queue = DispatchQueue(label: "cn.local.phonebase.ws.\(socketFd)-\(UUID().uuidString)")
         var yes: Int32 = 1
         setsockopt(socketFd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
-        // Cap send stall so a dead viewer cannot wedge VT callbacks; still allow full frames.
-        var tv = timeval(tv_sec: 0, tv_usec: 250_000)
-        setsockopt(socketFd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout.size(ofValue: tv)))
+        // 接收保持阻塞；发送用 MSG_DONTWAIT，避免编码线程被 TCP 堵住
     }
 
     /// 标记 fd 已移交，调用方不要再 close
@@ -65,19 +63,22 @@ final class WebSocketSession {
         return false
     }
 
-    /// Write full frame; false on timeout/error. Does not change isOpen.
+    /// Write full frame; false on would-block/error. Does not change isOpen.
     private func writeAll(_ frame: Data) -> Bool {
         guard fd >= 0, !frame.isEmpty else { return false }
         var offset = 0
         while offset < frame.count {
             let n = frame.withUnsafeBytes { raw -> Int in
                 guard let base = raw.baseAddress else { return -1 }
-                return Darwin.send(fd, base + offset, frame.count - offset, 0)
+                return Darwin.send(fd, base + offset, frame.count - offset, Int32(MSG_DONTWAIT))
             }
             if n > 0 {
                 offset += n
                 continue
             }
+            let err = errno
+            if err == EINTR { continue }
+            // EAGAIN/EWOULDBLOCK：本帧丢弃，上层 discardUnsent
             return false
         }
         return true

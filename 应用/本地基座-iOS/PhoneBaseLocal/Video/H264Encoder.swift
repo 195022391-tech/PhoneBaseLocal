@@ -175,10 +175,12 @@ final class H264Encoder {
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateBps as CFNumber)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: frameRate as CFNumber)
+        // ~2s GOP：比每秒 IDR 少尖峰；比 3s+ 恢复更快
+        let gop = max(frameRate * 2, 30)
         VTSessionSetProperty(
             sess,
             key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
-            value: max(frameRate, 15) as CFNumber
+            value: gop as CFNumber
         )
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTCompressionSessionPrepareToEncodeFrames(sess)

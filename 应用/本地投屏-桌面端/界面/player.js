@@ -378,10 +378,9 @@ export class Phb1Player {
       if (!this.configuring) this.configureDecoder(this.decoder ? this.decoderPreference + 1 : this.decoderPreference);
       return p;
     }
-    // 积压时丢帧等关键帧，勿整段重配（重配会更卡，放大全分辨率时尤甚）
-    if (this.decoder.decodeQueueSize > 2) {
+    // 积压只丢当前帧；勿 needsKeyframe（否则等到下一个 IDR 会整段「卡一下」）
+    if (this.decoder.decodeQueueSize > 4) {
       this.dropped++;
-      this.needsKeyframe = true;
       return p;
     }
     if (this.needsKeyframe && !p.keyframe) {

@@ -101,13 +101,21 @@ final class RootViewController: UIViewController {
             }
         }
         refreshIP()
-        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            self?.refreshIP()
-        }
+        // 勿用 3s 主线程轮询：和 CADisplayLink 抢主线程 → 投屏周期性卡一下
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(onAppActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             self?.runSelfTest()
         }
+    }
+
+    @objc private func onAppActive() {
+        refreshIP()
     }
 
     private func stylePrimary(_ button: UIButton, color: UIColor) {
