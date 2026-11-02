@@ -281,7 +281,7 @@ final class BaseRuntime {
     private func startupMessage(retired: [String], extra: String?) -> String {
         let ips = LanAddress.ipv4List().joined(separator: ", ")
         var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)"
-        msg += "\nbuild=0.1.33-home2"
+        msg += "\nbuild=0.1.34-info-lock"
         msg += "\ncapture=\(capture.backendName) encode=\(encodeW)x\(encodeH)"
         msg += "\ndeviceId=\(cachedDeviceId)"
         msg += "\nmemoryGuard=\(MemoryGuard.shared.automatic ? "on" : "off")"
@@ -328,8 +328,8 @@ final class BaseRuntime {
             "memoryGuard": MemoryGuard.shared.status,
             "release": [
                 "product": "local",
-                "version": "0.1.33",
-                "buildId": "local-rebuild-0.1.33-home2",
+                "version": "0.1.34",
+                "buildId": "local-rebuild-0.1.34-info-lock",
             ],
             "geometry": [
                 "width": w,

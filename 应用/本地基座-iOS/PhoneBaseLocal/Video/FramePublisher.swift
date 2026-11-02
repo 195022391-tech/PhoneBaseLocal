@@ -12,10 +12,13 @@ final class FramePublisher {
     private var frameSerial: Int64 = 0
     var onTimestampUs: ((UInt64) -> Void)?
 
-    /// 兼容 info.encoder 字段
+    /// 兼容 info.encoder；tryLock 避免与 encode 死锁堵死 /api/info
     var encoderStats: [String: Any] {
-        lock.lock(); defer { lock.unlock() }
-        if let lane = lanes[VideoSettingsStore.shared.defaults.key] ?? lanes.values.first {
+        guard lock.tryLock() else {
+            return ["ready": false, "busy": true, "width": sourceW, "height": sourceH]
+        }
+        defer { lock.unlock() }
+        if let lane = lanes.values.first(where: { !$0.profile.isWall }) ?? lanes.values.first {
             var s = lane.encoder.stats
             s["lane"] = lane.profile.key
             s["clients"] = clients.count
@@ -46,6 +49,7 @@ final class FramePublisher {
         let encoder: H264Encoder
         var lastConfig: Data?
         var lastEmitSerial: Int64 = 0
+        private(set) var started = false
         weak var owner: FramePublisher?
 
         init(profile: VideoStreamProfile, sourceW: Int, sourceH: Int, owner: FramePublisher) {
@@ -60,13 +64,20 @@ final class FramePublisher {
                 frameRate: profile.frameRate
             )
             self.owner = owner
+            let key = profile.key
             encoder.onConfig = { [weak self] avcC in
                 self?.lastConfig = avcC
-                self?.owner?.broadcastConfig(avcC, laneKey: profile.key)
+                self?.owner?.broadcastConfig(avcC, laneKey: key)
             }
             encoder.onFrame = { [weak self] avcc, keyframe, ts in
-                self?.owner?.broadcastFrame(avcc: avcc, keyframe: keyframe, timestampUs: ts, laneKey: profile.key)
+                self?.owner?.broadcastFrame(avcc: avcc, keyframe: keyframe, timestampUs: ts, laneKey: key)
             }
+            // 注意：禁止在 FramePublisher.lock 内 start（VT 回调会再抢锁 → 死锁）
+        }
+
+        func startIfNeeded() {
+            guard !started else { return }
+            started = true
             try? encoder.start()
         }
     }
@@ -81,11 +92,11 @@ final class FramePublisher {
         lock.lock()
         let client = Client(session: session, profile: p)
         clients.append(client)
-        ensureLaneLocked(p)
-        let lane = lanes[p.key]
+        let lane = ensureLaneLocked(p)
         let cfg = lane?.lastConfig
         lock.unlock()
 
+        lane?.startIfNeeded()
         session.sendText(#"{"type":"publisher","online":true}"#)
         if let cfg {
             _ = session.sendBinary(PHB1.packet(flags: .configuration, timestampUs: 0, payload: cfg))
@@ -96,10 +107,12 @@ final class FramePublisher {
 
         session.onClose = { [weak self, weak session] in
             guard let self, let session else { return }
+            var stopped: [Lane] = []
             self.lock.lock()
             self.clients.removeAll { $0.session === session }
-            self.pruneLanesLocked()
+            stopped = self.pruneLanesLocked()
             self.lock.unlock()
+            stopped.forEach { $0.encoder.stop() }
         }
     }
 
@@ -107,11 +120,11 @@ final class FramePublisher {
         lock.lock()
         let copy = clients
         clients.removeAll()
-        let oldLanes = lanes
+        let oldLanes = Array(lanes.values)
         lanes.removeAll()
         lock.unlock()
         copy.forEach { $0.session.close() }
-        oldLanes.values.forEach { $0.encoder.stop() }
+        oldLanes.forEach { $0.encoder.stop() }
     }
 
     func setPublisherOnline(_ online: Bool) {
@@ -133,21 +146,27 @@ final class FramePublisher {
         frameSerial += 1
         let serial = frameSerial
         let active = Dictionary(grouping: clients, by: { $0.profile.key })
-        var work: [(Lane, Bool)] = [] // lane, shouldEncode
+        var work: [Lane] = []
+        var toStart: [Lane] = []
         for (key, group) in active {
+            let existed = lanes[key] != nil
             guard let lane = lanes[key] ?? ensureLaneLocked(group[0].profile) else { continue }
+            if !existed { toStart.append(lane) }
             let fps = max(5, lane.profile.frameRate)
-            // 采集约 60fps；按档位抽帧
             let stride = max(1, Int((60.0 / Double(fps)).rounded()))
             let due = serial - lane.lastEmitSerial >= Int64(stride) || lane.lastEmitSerial == 0
             if due {
                 lane.lastEmitSerial = serial
-                work.append((lane, true))
+                work.append(lane)
             }
         }
         lock.unlock()
 
-        for (lane, _) in work {
+        // start 必须在 unlock 之后，否则 VT 回调抢锁死锁 → /api/info 永久卡住
+        toStart.forEach { $0.startIfNeeded() }
+        work.forEach { $0.startIfNeeded() }
+
+        for lane in work {
             let buf: CVPixelBuffer
             if CVPixelBufferGetWidth(buffer) == lane.encodeW,
                CVPixelBufferGetHeight(buffer) == lane.encodeH
@@ -169,22 +188,22 @@ final class FramePublisher {
         all.forEach { $0.encoder.forceKeyFrame() }
     }
 
-    /// memory-guard / video-settings：重建所有车道
     func recycleEncoder(reason: String) {
         NSLog("[Publisher] recycleEncoder %@", reason)
         lock.lock()
         let profiles = Array(Set(clients.map(\.profile)))
-        let old = lanes
+        let old = Array(lanes.values)
         lanes.removeAll()
+        var fresh: [Lane] = []
         for p in profiles {
-            _ = ensureLaneLocked(p)
+            if let lane = ensureLaneLocked(p) { fresh.append(lane) }
         }
-        // 若无客户端，至少保 foreground 车道
-        if lanes.isEmpty {
-            _ = ensureLaneLocked(VideoSettingsStore.shared.defaults)
+        if fresh.isEmpty, let lane = ensureLaneLocked(VideoSettingsStore.shared.defaults) {
+            fresh.append(lane)
         }
         lock.unlock()
-        old.values.forEach { $0.encoder.stop() }
+        fresh.forEach { $0.startIfNeeded() }
+        old.forEach { $0.encoder.stop() }
         requestKeyframe()
     }
 
@@ -210,13 +229,17 @@ final class FramePublisher {
         return lane
     }
 
-    private func pruneLanesLocked() {
+    /// 返回需要 stop 的车道（调用方在 unlock 后 stop）
+    private func pruneLanesLocked() -> [Lane] {
         let live = Set(clients.map(\.profile.key))
         let drop = lanes.keys.filter { !live.contains($0) }
+        var stopped: [Lane] = []
         for k in drop {
-            lanes[k]?.encoder.stop()
-            lanes.removeValue(forKey: k)
+            if let lane = lanes.removeValue(forKey: k) {
+                stopped.append(lane)
+            }
         }
+        return stopped
     }
 
     private func broadcastConfig(_ avcC: Data, laneKey: String) {
@@ -234,9 +257,9 @@ final class FramePublisher {
         let packet = PHB1.packet(flags: keyframe ? .keyframe : .delta, timestampUs: timestampUs, payload: avcc)
         lock.lock()
         let targets = clients.filter { $0.profile.key == laneKey }
+        let lane = lanes[laneKey]
         lock.unlock()
         for c in targets {
-            // discardUnsent：拥塞时丢 delta，等关键帧再试
             if c.congested && !keyframe { continue }
             if c.session.sendBinary(packet) {
                 if keyframe { c.congested = false }
@@ -244,9 +267,7 @@ final class FramePublisher {
                 let firstStall = !c.congested
                 c.congested = true
                 if firstStall {
-                    lock.lock()
-                    lanes[laneKey]?.encoder.forceKeyFrame()
-                    lock.unlock()
+                    lane?.encoder.forceKeyFrame()
                 }
             }
         }
