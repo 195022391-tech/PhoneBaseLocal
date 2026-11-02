@@ -14,7 +14,7 @@ final class FramePublisher {
 
     /// 兼容 info.encoder；tryLock 避免与 encode 死锁堵死 /api/info
     var encoderStats: [String: Any] {
-        guard lock.tryLock() else {
+        guard lock.`try`() else {
             return ["ready": false, "busy": true, "width": sourceW, "height": sourceH]
         }
         defer { lock.unlock() }
