@@ -133,19 +133,30 @@ final class IOHIDTouchInjector: TouchInjector {
 
     func pressHome() {
         guard isAvailable else { return }
+        queue.async { [weak self] in self?.menuPulseLocked() }
+    }
+
+    /// 双击 Home：两次 Menu 脉冲，间隔约 0.25s → SpringBoard 多任务
+    func pressAppSwitcher() {
+        guard isAvailable else { return }
         queue.async { [weak self] in
             guard let self else { return }
-            if self.touching {
-                self.postHand(phase: .lifted, x: self.lastX, y: self.lastY)
-                self.touching = false
-            }
-            // tipa menuDown
-            self.postKeyboard(usagePage: 0x0C, usage: 0x40, down: true)
+            NSLog("[IOHID] app-switcher (double menu)")
+            self.menuPulseLocked()
+            usleep(250_000)
+            self.menuPulseLocked()
         }
-        // tipa menuUp（与 down 拆开，避免堵控制线程）
-        queue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            self?.postKeyboard(usagePage: 0x0C, usage: 0x40, down: false)
+    }
+
+    private func menuPulseLocked() {
+        if touching {
+            postHand(phase: .lifted, x: lastX, y: lastY)
+            touching = false
         }
+        // tipa Consumer Menu/Home 0x0C/0x40
+        postKeyboard(usagePage: 0x0C, usage: 0x40, down: true)
+        usleep(50_000)
+        postKeyboard(usagePage: 0x0C, usage: 0x40, down: false)
     }
 
     func injectText(_ text: String) {

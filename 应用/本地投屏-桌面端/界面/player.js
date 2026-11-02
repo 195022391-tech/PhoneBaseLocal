@@ -558,9 +558,18 @@ export class ControlClient {
 
   /**
    * 官方：cancelGesture 后发 {type:"button",button:"home",seq}，等 ack（有超时，避免放大窗卡死）。
-   * @param {{ cancelGesture?: () => void }} [opts]
+   * @param {{ cancelGesture?: () => void, button?: string }} [opts]
    */
   home(opts = {}) {
+    return this.sendButton(opts.button || "home", opts);
+  }
+
+  /** 双击 Home → 多任务 */
+  appSwitcher(opts = {}) {
+    return this.sendButton("app-switcher", opts);
+  }
+
+  sendButton(button, opts = {}) {
     if (!this.ready || this.ws?.readyState !== WebSocket.OPEN) return Promise.resolve(false);
     if (this.homeAvailable === false) return Promise.resolve(false);
     try {
@@ -568,7 +577,7 @@ export class ControlClient {
     } catch {
       /* ignore */
     }
-    const body = { type: "button", button: "home", seq: ++this.seq };
+    const body = { type: "button", button, seq: ++this.seq };
     return new Promise((resolve) => {
       const entry = {
         resolve: (msg) => resolve(msg || { ok: true }),

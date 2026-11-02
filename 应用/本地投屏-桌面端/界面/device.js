@@ -44,7 +44,6 @@ let lastFitKey = "";
 let preferFillWorkArea = false;
 let fitInFlight = false;
 let fitTimer = null;
-let homeBusy = false;
 /** 由 bindPointer 写入：Home 前取消手势（对齐官方 cancelGesture） */
 let cancelActiveGesture = () => {};
 
@@ -667,24 +666,40 @@ async function maximizeToWorkArea() {
 $("win-min").onclick = () => window.desktopLocal?.windowMinimize?.();
 $("win-max").onclick = () => void maximizeToWorkArea();
 $("close-device").onclick = () => window.desktopLocal?.windowClose?.() ?? window.close();
+let homeClickTimer = null;
+let homeClickCount = 0;
+
 function pressHome() {
-  if (homeBusy || !control?.ready) return;
-  homeBusy = true;
+  if (!control?.ready) return;
   // 官方：Home 前 cancelGesture，避免触控 capture 与放大窗 fit 缠在一起卡死
-  void control
-    .home({ cancelGesture: cancelActiveGesture })
-    .catch(() => {})
-    .finally(() => {
-      setTimeout(() => {
-        homeBusy = false;
-      }, 400);
-    });
+  void control.home({ cancelGesture: cancelActiveGesture }).catch(() => {});
 }
+
+function pressAppSwitcher() {
+  if (!control?.ready) return;
+  void control.appSwitcher({ cancelGesture: cancelActiveGesture }).catch(() => {});
+}
+
 $("home-device").onclick = (e) => {
   e.preventDefault();
   e.stopPropagation();
-  pressHome();
+  // 单击 Home；280ms 内再点 → 多任务（勿用 busy 吞第二次）
+  homeClickCount += 1;
+  if (homeClickCount === 1) {
+    homeClickTimer = setTimeout(() => {
+      homeClickCount = 0;
+      homeClickTimer = null;
+      pressHome();
+    }, 280);
+  } else {
+    clearTimeout(homeClickTimer);
+    homeClickTimer = null;
+    homeClickCount = 0;
+    pressAppSwitcher();
+  }
 };
+$("home-device").title = "单击 Home；双击打开多任务";
+$("home-device").setAttribute("aria-label", "单击 Home，双击多任务");
 $("maximize-device").onclick = () => void maximizeToWorkArea();
 window.desktopLocal?.onDeviceSetMode?.((payload) => {
   if (payload?.mode) setPresentation(payload.mode);

@@ -143,8 +143,12 @@ final class ControlHub {
             }
         case "button":
             let seq = intVal(obj["seq"]) ?? 0
-            if (obj["button"] as? String) == "home" {
+            let btn = obj["button"] as? String ?? ""
+            if btn == "home" {
                 injector.pressHome()
+                ack(session, seq: seq, ok: true)
+            } else if btn == "app-switcher" || btn == "task-switcher" {
+                injector.pressAppSwitcher()
                 ack(session, seq: seq, ok: true)
             } else {
                 ack(session, seq: seq, ok: false, error: "unsupported button")
@@ -152,6 +156,10 @@ final class ControlHub {
         case "home":
             let seq = intVal(obj["seq"]) ?? 0
             injector.pressHome()
+            ack(session, seq: seq, ok: true)
+        case "app-switcher":
+            let seq = intVal(obj["seq"]) ?? 0
+            injector.pressAppSwitcher()
             ack(session, seq: seq, ok: true)
         case "text":
             let seq = intVal(obj["seq"]) ?? 0

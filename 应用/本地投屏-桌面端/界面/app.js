@@ -773,11 +773,15 @@ function confirmDelete() {
   renderAll();
 }
 
-function rememberOpenWindow(device, open) {
+function rememberOpenWindow(device, open, modeOverride) {
   const ip = String(device.ip || "");
   const port = Number(device.port) || 11019;
   if (!ip) return;
-  const mode = state.prefs.orientation === "portrait" ? "portrait" : "landscape";
+  const wall = state.prefs.orientation === "portrait" ? "portrait" : "landscape";
+  const phone = phoneOrientationMode(device);
+  const mode =
+    modeOverride ||
+    (phone === "landscape" && wall === "landscape" ? "landscape" : phone || wall);
   const next = (state.prefs.openWindows || []).filter(
     (w) => !(w.ip === ip && Number(w.port) === port)
   );
@@ -794,16 +798,27 @@ function rememberOpenWindow(device, open) {
   saveStore();
 }
 
+function phoneOrientationMode(device) {
+  const online = state.online.get(device.id);
+  const o = Number(online?.info?.geometry?.orientation ?? online?.info?.orientation);
+  if ([3, 4, 7, 8].includes(o)) return "landscape";
+  if ([1, 2, 5, 6].includes(o)) return "portrait";
+  return null;
+}
+
 function openDeviceWindow(device) {
-  const mode = state.prefs.orientation === "portrait" ? "portrait" : "landscape";
-  rememberOpenWindow(device, true);
+  const wall = state.prefs.orientation === "portrait" ? "portrait" : "landscape";
+  const phone = phoneOrientationMode(device);
+  // 墙横 + 手机横 → 大窗横；有手机朝向时优先跟手机，否则跟墙
+  const mode =
+    phone === "landscape" && wall === "landscape" ? "landscape" : phone || wall;
+  rememberOpenWindow(device, true, mode);
   window.desktopLocal?.openDeviceWindow?.({
     id: device.id,
     ip: device.ip,
     port: device.port,
     name: displayName(device),
     deviceId: device.deviceId,
-    // 与官方一致：跟设备墙横/竖屏偏好打开独立窗
     mode,
   });
 }

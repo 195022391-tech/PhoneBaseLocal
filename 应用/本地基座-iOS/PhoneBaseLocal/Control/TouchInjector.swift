@@ -4,6 +4,8 @@ import UIKit
 protocol TouchInjector: AnyObject {
     func pointer(action: String, x: Double, y: Double)
     func pressHome()
+    /// 双击 Home → 多任务/App Switcher
+    func pressAppSwitcher()
     func injectText(_ text: String)
     func injectKey(_ key: String)
 }
@@ -27,6 +29,10 @@ final class LogTouchInjector: TouchInjector {
 
     func pressHome() {
         NSLog("[Touch] home")
+    }
+
+    func pressAppSwitcher() {
+        NSLog("[Touch] app-switcher")
     }
 
     func injectText(_ text: String) {
