@@ -675,9 +675,26 @@ function pressHome() {
   void control.home({ cancelGesture: cancelActiveGesture }).catch(() => {});
 }
 
-function pressAppSwitcher() {
+async function pressAppSwitcher() {
   if (!control?.ready) return;
-  void control.appSwitcher({ cancelGesture: cancelActiveGesture }).catch(() => {});
+  const opts = { cancelGesture: cancelActiveGesture };
+  try {
+    const r = await control.appSwitcher(opts);
+    // 旧基座不认 app-switcher → 连发两次 Home
+    if (r && r.ok === false) {
+      await control.home(opts);
+      await new Promise((x) => setTimeout(x, 250));
+      await control.home(opts);
+    }
+  } catch {
+    try {
+      await control.home(opts);
+      await new Promise((x) => setTimeout(x, 250));
+      await control.home(opts);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 $("home-device").onclick = (e) => {
