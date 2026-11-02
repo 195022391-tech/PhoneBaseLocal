@@ -7,9 +7,12 @@ final class FramePublisher {
     private let sourceW: Int
     private let sourceH: Int
     private let lock = NSLock()
+    private let encodeQueue = DispatchQueue(label: "cn.local.phonebase.publish.encode", qos: .userInteractive)
     private var clients: [Client] = []
     private var lanes: [String: Lane] = [:]
     private var frameSerial: Int64 = 0
+    private var pendingEncode: (CVPixelBuffer, CMTime)?
+    private var encodeScheduled = false
     var onTimestampUs: ((UInt64) -> Void)?
 
     /// 兼容 info.encoder；tryLock 避免与 encode 死锁堵死 /api/info
@@ -36,6 +39,7 @@ final class FramePublisher {
         let session: WebSocketSession
         var profile: VideoStreamProfile
         var congested = false
+        var lastKeyRequestMs: UInt64 = 0
         init(session: WebSocketSession, profile: VideoStreamProfile) {
             self.session = session
             self.profile = profile
@@ -142,42 +146,70 @@ final class FramePublisher {
     }
 
     func encode(buffer: CVPixelBuffer, presentationTime: CMTime) {
+        // 采集在主线程；缩放+双路编码挪到 encodeQueue，latest-wins，避免墙流拖死大窗/主线程
         lock.lock()
-        frameSerial += 1
-        let serial = frameSerial
-        let active = Dictionary(grouping: clients, by: { $0.profile.key })
-        var work: [Lane] = []
-        var toStart: [Lane] = []
-        for (key, group) in active {
-            let existed = lanes[key] != nil
-            guard let lane = lanes[key] ?? ensureLaneLocked(group[0].profile) else { continue }
-            if !existed { toStart.append(lane) }
-            let fps = max(5, lane.profile.frameRate)
-            let stride = max(1, Int((60.0 / Double(fps)).rounded()))
-            let due = serial - lane.lastEmitSerial >= Int64(stride) || lane.lastEmitSerial == 0
-            if due {
-                lane.lastEmitSerial = serial
-                work.append(lane)
-            }
-        }
+        pendingEncode = (buffer, presentationTime)
+        let needSchedule = !encodeScheduled
+        if needSchedule { encodeScheduled = true }
         lock.unlock()
+        guard needSchedule else { return }
+        encodeQueue.async { [weak self] in self?.drainEncode() }
+    }
 
-        // start 必须在 unlock 之后，否则 VT 回调抢锁死锁 → /api/info 永久卡住
-        toStart.forEach { $0.startIfNeeded() }
-        work.forEach { $0.startIfNeeded() }
-
-        for lane in work {
-            let buf: CVPixelBuffer
-            if CVPixelBufferGetWidth(buffer) == lane.encodeW,
-               CVPixelBufferGetHeight(buffer) == lane.encodeH
-            {
-                buf = buffer
-            } else if let scaled = PixelBufferScaler.scale(buffer, width: lane.encodeW, height: lane.encodeH) {
-                buf = scaled
-            } else {
-                continue
+    private func drainEncode() {
+        while true {
+            lock.lock()
+            guard let pending = pendingEncode else {
+                encodeScheduled = false
+                lock.unlock()
+                return
             }
-            lane.encoder.encode(buffer: buf, presentationTime: presentationTime)
+            pendingEncode = nil
+            frameSerial += 1
+            let serial = frameSerial
+            let active = Dictionary(grouping: clients, by: { $0.profile.key })
+            var work: [Lane] = []
+            var toStart: [Lane] = []
+            for (key, group) in active {
+                let existed = lanes[key] != nil
+                guard let lane = lanes[key] ?? ensureLaneLocked(group[0].profile) else { continue }
+                if !existed { toStart.append(lane) }
+                let fps = max(5, lane.profile.frameRate)
+                let stride = max(1, Int((60.0 / Double(fps)).rounded()))
+                let due = serial - lane.lastEmitSerial >= Int64(stride) || lane.lastEmitSerial == 0
+                if due {
+                    lane.lastEmitSerial = serial
+                    work.append(lane)
+                }
+            }
+            // 大窗优先：先 foreground 再 wall，减少双开时墙流抢 VT/缩放把大窗拖卡
+            work.sort { a, b in
+                let aw = a.profile.isWall
+                let bw = b.profile.isWall
+                if aw != bw { return !aw && bw }
+                return a.profile.key < b.profile.key
+            }
+            lock.unlock()
+
+            // start 必须在 unlock 之后，否则 VT 回调抢锁死锁 → /api/info 永久卡住
+            toStart.forEach { $0.startIfNeeded() }
+            work.forEach { $0.startIfNeeded() }
+
+            let buffer = pending.0
+            let presentationTime = pending.1
+            for lane in work {
+                let buf: CVPixelBuffer
+                if CVPixelBufferGetWidth(buffer) == lane.encodeW,
+                   CVPixelBufferGetHeight(buffer) == lane.encodeH
+                {
+                    buf = buffer
+                } else if let scaled = PixelBufferScaler.scale(buffer, width: lane.encodeW, height: lane.encodeH) {
+                    buf = scaled
+                } else {
+                    continue
+                }
+                lane.encoder.encode(buffer: buf, presentationTime: presentationTime)
+            }
         }
     }
 
@@ -259,14 +291,23 @@ final class FramePublisher {
         let targets = clients.filter { $0.profile.key == laneKey }
         let lane = lanes[laneKey]
         lock.unlock()
+        let nowMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
         for c in targets {
-            if c.congested && !keyframe { continue }
+            if c.congested && !keyframe {
+                // 背压后若关键帧一直发不出去，必须周期性再要 IDR，否则墙流会停在旧画面
+                if nowMs &- c.lastKeyRequestMs >= 400 {
+                    c.lastKeyRequestMs = nowMs
+                    lane?.encoder.forceKeyFrame()
+                }
+                continue
+            }
             if c.session.sendBinary(packet) {
                 if keyframe { c.congested = false }
             } else {
                 let firstStall = !c.congested
                 c.congested = true
-                if firstStall {
+                if firstStall || (keyframe && nowMs &- c.lastKeyRequestMs >= 200) {
+                    c.lastKeyRequestMs = nowMs
                     lane?.encoder.forceKeyFrame()
                 }
             }

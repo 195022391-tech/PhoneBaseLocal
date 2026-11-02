@@ -64,9 +64,11 @@ final class WebSocketSession {
     }
 
     /// Write full frame; false on would-block/error. Does not change isOpen.
+    /// discardUnsent：仅在「尚未写出任何字节」时可整帧丢弃；半包必须写完，否则 WS 流损坏 → 墙流永久卡死。
     private func writeAll(_ frame: Data) -> Bool {
         guard fd >= 0, !frame.isEmpty else { return false }
         var offset = 0
+        var spins = 0
         while offset < frame.count {
             let n = frame.withUnsafeBytes { raw -> Int in
                 guard let base = raw.baseAddress else { return -1 }
@@ -74,11 +76,22 @@ final class WebSocketSession {
             }
             if n > 0 {
                 offset += n
+                spins = 0
                 continue
             }
             let err = errno
             if err == EINTR { continue }
-            // EAGAIN/EWOULDBLOCK：本帧丢弃，上层 discardUnsent
+            if err == EAGAIN || err == EWOULDBLOCK {
+                if offset == 0 {
+                    // 整帧尚未发出：上层丢帧
+                    return false
+                }
+                // 已写出半包：短自旋把尾巴写完，避免协议错位
+                spins += 1
+                if spins > 2000 { return false }
+                sched_yield()
+                continue
+            }
             return false
         }
         return true

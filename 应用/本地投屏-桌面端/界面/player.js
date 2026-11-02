@@ -665,18 +665,34 @@ export class ControlClient {
 }
 
 export class VideoSession {
-  constructor({ canvas, getProfile, onFrameTs, onFirstFrame, onSize, onStatus, onError, presentation = "original" }) {
+  constructor({ canvas, getProfile, onFrameTs, onFirstFrame, onSize, onStatus, onError, presentation = "original", autoRecover = true }) {
     this.canvas = canvas;
     this.getProfile = getProfile;
     this.onStatus = onStatus;
     this.onError = onError;
+    this.autoRecover = autoRecover !== false;
+    this.lastPaintAt = 0;
+    this.stallTimer = null;
+    this.recoverTimer = null;
     this.player = new Phb1Player(canvas, {
-      onFrameTs,
-      onFirstFrame,
+      onFrameTs: (ts) => {
+        this.lastPaintAt = performance.now();
+        onFrameTs?.(ts);
+      },
+      onFirstFrame: () => {
+        this.lastPaintAt = performance.now();
+        onFirstFrame?.();
+      },
       onSize,
       onError,
       presentation,
     });
+    // 解码出帧也算“在画”，避免仅靠 timestamp
+    const prevOnFrames = this.player.onFrames;
+    this.player.onFrames = (n) => {
+      if (n > 0) this.lastPaintAt = performance.now();
+      prevOnFrames?.(n);
+    };
     this.ws = null;
     this.baseWs = null;
     this.streamProfile = null;
@@ -688,7 +704,57 @@ export class VideoSession {
     this.baseWs = baseWs;
     this.alive = true;
     const profile = this.getProfile(this.streamProfile);
-    return this.openVideo(profile, { initial });
+    const out = await this.openVideo(profile, { initial });
+    this.armStallWatch();
+    return out;
+  }
+
+  armStallWatch() {
+    if (!this.autoRecover) return;
+    if (this.stallTimer) clearInterval(this.stallTimer);
+    this.stallTimer = setInterval(() => {
+      if (!this.alive || this.reconnecting || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      if (!this.lastPaintAt) return;
+      // 墙流双开时偶发卡在旧帧：超过 2.5s 无新画面则重拉一路
+      if (performance.now() - this.lastPaintAt > 2500) {
+        this.recover("画面停滞，重连…");
+      }
+    }, 1000);
+  }
+
+  recover(reason) {
+    if (!this.alive || this.reconnecting || !this.baseWs) return;
+    if (this.recoverTimer) return;
+    this.onStatus?.(reason || "画面重连…");
+    this.recoverTimer = setTimeout(async () => {
+      this.recoverTimer = null;
+      if (!this.alive || this.reconnecting || !this.baseWs) return;
+      const profile = this.getProfile(this.streamProfile) || this.streamProfile;
+      if (!profile) return;
+      this.reconnecting = true;
+      const old = this.ws;
+      this.ws = null;
+      try {
+        old?.close();
+      } catch {}
+      this.player.reset();
+      this.lastPaintAt = 0;
+      try {
+        await this.openVideo(profile);
+        this.lastPaintAt = performance.now();
+      } catch {
+        this.onStatus?.("画面重连失败");
+        // 再试一次（退避）
+        if (this.alive) {
+          this.recoverTimer = setTimeout(() => {
+            this.recoverTimer = null;
+            this.recover("画面重连…");
+          }, 1200);
+        }
+      } finally {
+        this.reconnecting = false;
+      }
+    }, 80);
   }
 
   openVideo(streamProfile, { initial = false } = {}) {
@@ -706,6 +772,7 @@ export class VideoSession {
       const t = setTimeout(() => reject(new Error("视频连接超时")), 6000);
       ws.onopen = () => {
         clearTimeout(t);
+        this.lastPaintAt = performance.now();
         this.onStatus?.("画面已连接");
         resolve();
       };
@@ -723,6 +790,7 @@ export class VideoSession {
               this.onStatus?.("发布端离线");
             } else if (j.type === "publisher" && j.online === true) {
               this.onStatus?.("发布端在线");
+              this.player.needsKeyframe = true;
             }
           } catch {}
           return;
@@ -734,7 +802,9 @@ export class VideoSession {
         }
       };
       ws.onclose = () => {
-        if (this.alive && !this.reconnecting) this.onStatus?.("画面断开");
+        if (!this.alive || this.reconnecting) return;
+        this.onStatus?.("画面断开");
+        if (this.autoRecover) this.recover("画面断开，重连…");
       };
     });
   }
@@ -756,8 +826,10 @@ export class VideoSession {
       old?.close();
     } catch {}
     this.player.reset();
+    this.lastPaintAt = 0;
     try {
       await this.openVideo(next);
+      this.lastPaintAt = performance.now();
     } finally {
       this.reconnecting = false;
     }
@@ -766,6 +838,14 @@ export class VideoSession {
   close() {
     this.alive = false;
     this.reconnecting = false;
+    if (this.stallTimer) {
+      clearInterval(this.stallTimer);
+      this.stallTimer = null;
+    }
+    if (this.recoverTimer) {
+      clearTimeout(this.recoverTimer);
+      this.recoverTimer = null;
+    }
     try {
       this.ws?.close();
     } catch {}
