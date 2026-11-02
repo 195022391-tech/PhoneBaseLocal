@@ -6,6 +6,8 @@ import Darwin
 final class IOHIDTouchInjector: TouchInjector {
     private let client: OpaquePointer?
     private let queue = DispatchQueue(label: "cn.local.phonebase.hid-events", qos: .userInteractive)
+    /// Home/按键独立队列，不被滑动 drain 堵在后面（否则点 Home 体感慢半拍～1s）
+    private let keyQueue = DispatchQueue(label: "cn.local.phonebase.hid-keys", qos: .userInteractive)
     private let moveLock = NSLock()
     private var touching = false
     private var lastX: Double = 0.5
@@ -133,29 +135,47 @@ final class IOHIDTouchInjector: TouchInjector {
 
     func pressHome() {
         guard isAvailable else { return }
-        queue.async { [weak self] in self?.menuPulseLocked() }
+        // 丢掉未发出的 move，避免 digitizer 队列拖住后续抬起
+        moveLock.lock()
+        coalescedMove = nil
+        moveDrainScheduled = false
+        moveLock.unlock()
+        keyQueue.async { [weak self] in self?.menuPulseFast() }
     }
 
-    /// 双击 Home：两次 Menu 脉冲，间隔约 0.25s → SpringBoard 多任务
+    /// 双击 Home：两次 Menu 脉冲 → SpringBoard 多任务
     func pressAppSwitcher() {
         guard isAvailable else { return }
-        queue.async { [weak self] in
+        moveLock.lock()
+        coalescedMove = nil
+        moveDrainScheduled = false
+        moveLock.unlock()
+        keyQueue.async { [weak self] in
             guard let self else { return }
             NSLog("[IOHID] app-switcher (double menu)")
-            self.menuPulseLocked()
-            usleep(250_000)
-            self.menuPulseLocked()
+            self.menuPulseFast()
+            usleep(200_000)
+            self.menuPulseFast()
         }
     }
 
-    private func menuPulseLocked() {
+    /// 在 keyQueue 上执行：先快速抬指，再短脉冲 Menu（约 12ms）
+    private func menuPulseFast() {
         if touching {
-            postHand(phase: .lifted, x: lastX, y: lastY)
-            touching = false
+            let sem = DispatchSemaphore(value: 0)
+            queue.async { [weak self] in
+                guard let self else { sem.signal(); return }
+                if self.touching {
+                    self.postHand(phase: .lifted, x: self.lastX, y: self.lastY)
+                    self.touching = false
+                }
+                sem.signal()
+            }
+            _ = sem.wait(timeout: .now() + 0.03)
         }
-        // tipa Consumer Menu/Home 0x0C/0x40
+        // tipa Consumer Menu/Home 0x0C/0x40；脉冲尽量短，跟手
         postKeyboard(usagePage: 0x0C, usage: 0x40, down: true)
-        usleep(50_000)
+        usleep(12_000)
         postKeyboard(usagePage: 0x0C, usage: 0x40, down: false)
     }
 

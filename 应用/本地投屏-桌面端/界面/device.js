@@ -666,57 +666,24 @@ async function maximizeToWorkArea() {
 $("win-min").onclick = () => window.desktopLocal?.windowMinimize?.();
 $("win-max").onclick = () => void maximizeToWorkArea();
 $("close-device").onclick = () => window.desktopLocal?.windowClose?.() ?? window.close();
-let homeClickTimer = null;
-let homeClickCount = 0;
-
 function pressHome() {
   if (!control?.ready) return;
-  // 官方：Home 前 cancelGesture，避免触控 capture 与放大窗 fit 缠在一起卡死
-  void control.home({ cancelGesture: cancelActiveGesture }).catch(() => {});
-}
-
-async function pressAppSwitcher() {
-  if (!control?.ready) return;
-  const opts = { cancelGesture: cancelActiveGesture };
+  // 先发 Home，再清手势：避免 cancel 的 pointer 包排在 Home 前面拖慢
+  void control.home({}).catch(() => {});
   try {
-    const r = await control.appSwitcher(opts);
-    // 旧基座不认 app-switcher → 连发两次 Home
-    if (r && r.ok === false) {
-      await control.home(opts);
-      await new Promise((x) => setTimeout(x, 250));
-      await control.home(opts);
-    }
+    cancelActiveGesture();
   } catch {
-    try {
-      await control.home(opts);
-      await new Promise((x) => setTimeout(x, 250));
-      await control.home(opts);
-    } catch {
-      /* ignore */
-    }
+    /* ignore */
   }
 }
 
 $("home-device").onclick = (e) => {
   e.preventDefault();
   e.stopPropagation();
-  // 单击 Home；280ms 内再点 → 多任务（勿用 busy 吞第二次）
-  homeClickCount += 1;
-  if (homeClickCount === 1) {
-    homeClickTimer = setTimeout(() => {
-      homeClickCount = 0;
-      homeClickTimer = null;
-      pressHome();
-    }, 280);
-  } else {
-    clearTimeout(homeClickTimer);
-    homeClickTimer = null;
-    homeClickCount = 0;
-    pressAppSwitcher();
-  }
+  pressHome();
 };
-$("home-device").title = "单击 Home；双击打开多任务";
-$("home-device").setAttribute("aria-label", "单击 Home，双击多任务");
+$("home-device").title = "单击 Home；连点两次打开多任务";
+$("home-device").setAttribute("aria-label", "单击 Home，连点两次多任务");
 $("maximize-device").onclick = () => void maximizeToWorkArea();
 window.desktopLocal?.onDeviceSetMode?.((payload) => {
   if (payload?.mode) setPresentation(payload.mode);
