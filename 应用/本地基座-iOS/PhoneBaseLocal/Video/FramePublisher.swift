@@ -255,11 +255,17 @@ final class FramePublisher {
         recycleEncoder(reason: "video-settings")
     }
 
-    /// ABR 热更新：不改 lane key，只调编码器码率
-    private func applyEffectiveBitrateToForegroundLanesLocked() {
+    /// ABR 热更新：前景跟 settings；墙流按自身档位 × permille（小窗背压也要降峰）
+    private func applyEffectiveBitrateToLanesLocked() {
+        let permille = VideoSettingsStore.shared.networkBitratePermilleValue()
         let d = VideoSettingsStore.shared.defaults
-        for lane in lanes.values where !lane.profile.isWall {
-            lane.encoder.updateRate(bitrateBps: d.bitrateBps, frameRate: d.frameRate)
+        for lane in lanes.values {
+            if lane.profile.isWall {
+                let br = max(400_000, lane.profile.bitrateBps * permille / 1000)
+                lane.encoder.updateRate(bitrateBps: br, frameRate: lane.profile.frameRate)
+            } else {
+                lane.encoder.updateRate(bitrateBps: d.bitrateBps, frameRate: d.frameRate)
+            }
         }
     }
 
@@ -271,7 +277,7 @@ final class FramePublisher {
             let next = max(400, cur - 150)
             if next != cur {
                 VideoSettingsStore.shared.setNetworkBitratePermille(next)
-                applyEffectiveBitrateToForegroundLanesLocked()
+                applyEffectiveBitrateToLanesLocked()
             }
             return
         }
@@ -279,7 +285,7 @@ final class FramePublisher {
         if clients.contains(where: { $0.healthySinceMs != 0 && nowMs &- $0.healthySinceMs >= 2000 }), cur < 1000 {
             let next = min(1000, cur + 100)
             VideoSettingsStore.shared.setNetworkBitratePermille(next)
-            applyEffectiveBitrateToForegroundLanesLocked()
+            applyEffectiveBitrateToLanesLocked()
         }
     }
 
@@ -302,14 +308,19 @@ final class FramePublisher {
         }
         client.congested = true
         client.healthySinceMs = 0
-        // 发不动：只挂起最新一帧，等待下一轮或关键帧
+        // 发不动：只挂起最新一帧，等待下一轮或自然关键帧
         client.pendingVideo = packet
         client.pendingIsKeyframe = keyframe
+        // 墙流优先等自然 1s GOP，避免每秒 force IDR 造成小窗规律卡顿；≥2s 仍堵再兜底
+        requestKeyframeIfNeeded(client, lane: lane, urgent: keyframe)
+    }
+
+    private func requestKeyframeIfNeeded(_ client: Client, lane: Lane?, urgent: Bool) {
         let nowMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
-        if keyframe || nowMs &- client.lastKeyRequestMs >= 1000 {
-            client.lastKeyRequestMs = nowMs
-            lane?.encoder.forceKeyFrame()
-        }
+        let waitMs: UInt64 = client.profile.isWall ? 2000 : 1000
+        guard urgent || nowMs &- client.lastKeyRequestMs >= waitMs else { return }
+        client.lastKeyRequestMs = nowMs
+        lane?.encoder.forceKeyFrame()
     }
 
     @discardableResult
@@ -372,11 +383,8 @@ final class FramePublisher {
                 if c.pendingVideo != nil, !c.pendingIsKeyframe {
                     c.pendingVideo = nil
                 }
-                // 对齐官方 dropUntilKeyframe：等自然 GOP；最多约 1s 再要一次
-                if nowMs &- c.lastKeyRequestMs >= 1000 {
-                    c.lastKeyRequestMs = nowMs
-                    lane?.encoder.forceKeyFrame()
-                }
+                // dropUntilKeyframe：等自然 GOP；墙流 ≥2s / 前景 ≥1s 仍堵再 force
+                requestKeyframeIfNeeded(c, lane: lane, urgent: false)
                 continue
             }
             enqueueOrSend(c, packet: packet, keyframe: keyframe, lane: lane)

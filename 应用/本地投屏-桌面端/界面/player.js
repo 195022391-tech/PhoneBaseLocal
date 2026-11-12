@@ -30,13 +30,13 @@ function codecFromAvcC(avcC) {
   return `avc1.${hex}`;
 }
 
-/** 官方 Ve：portrait/landscape 与帧比例不一致时旋进画面；CARenderServer 竖缓冲里的横屏内容需 270° 而非 90°（90° 会倒着） */
+/** 官方 mt/Ve（商业 v1.7）：portrait/landscape 与帧比例不一致时返回 90°（不是 270°） */
 export function presentationRotationFor(mode, frameW, frameH) {
   if (mode !== "portrait" && mode !== "landscape") return 0;
   if (!Number.isFinite(frameW) || !Number.isFinite(frameH) || frameW <= 0 || frameH <= 0 || frameW === frameH) {
     return 0;
   }
-  return (mode === "landscape") === frameW > frameH ? 0 : 270;
+  return (mode === "landscape") === frameW > frameH ? 0 : 90;
 }
 
 /**
@@ -168,8 +168,17 @@ export function buildVideoUrl(base, streamProfile) {
   return `${base}/video?profile=wall&maxDimension=${dim}&frameRate=${fps}`;
 }
 
+/** 对齐商业版：pending 包队列上限 / 字节上限 / decodeQueue 阈值 */
+const PENDING_WHEN_READY = 16;
+const PENDING_WHEN_BUSY = 8;
+const PENDING_BYTES_MAX = 2 * 1024 * 1024;
+const DECODE_QUEUE_MAX = 3;
+/** 官方 device.js：墙流 Gt=software-first，大窗 Ht=hardware/no-preference */
+const DECODER_PREFS_WALL = ["prefer-software", "no-preference"];
+const DECODER_PREFS_FOREGROUND = ["prefer-hardware", "prefer-software", "no-preference"];
+
 export class Phb1Player {
-  constructor(canvasEl, { onFrameTs, onFrames, onFirstFrame, onSize, onError, presentation = "original" } = {}) {
+  constructor(canvasEl, { onFrameTs, onFrames, onFirstFrame, onSize, onError, presentation = "original", wall = false } = {}) {
     this.canvas = canvasEl;
     this.ctx = canvasEl.getContext("2d", { alpha: false, desynchronized: true });
     if (this.ctx) {
@@ -183,15 +192,20 @@ export class Phb1Player {
     this.onError = onError;
     // portrait | landscape | original — 与官方一致：比例不匹配时旋转绘制进 canvas
     this.presentation = presentation;
-    this.decoderPreferences = ["prefer-hardware", "prefer-software", "no-preference"];
+    this.wall = wall === true;
+    this.decoderPreferences = this.wall ? DECODER_PREFS_WALL : DECODER_PREFS_FOREGROUND;
     this.decoderPreference = 0;
     this.decoder = null;
     this.configuration = null;
+    this.verifiedConfiguration = null;
     this.codec = null;
     this.configured = false;
     this.needsKeyframe = true;
     this.configuring = false;
-    this.pendingKey = null;
+    this.pendingPackets = [];
+    this.pendingBytes = 0;
+    this.drainingPending = false;
+    this.outputTimestampFloor = null;
     this.generation = 0;
     this.lastTs = 0;
     this.frames = 0;
@@ -200,6 +214,10 @@ export class Phb1Player {
 
   reset() {
     this.generation += 1;
+    this.configuring = false;
+    this.clearPendingPackets();
+    this.verifiedConfiguration = null;
+    this.outputTimestampFloor = null;
     try {
       this.decoder?.close();
     } catch {}
@@ -208,8 +226,6 @@ export class Phb1Player {
     this.codec = null;
     this.configured = false;
     this.needsKeyframe = true;
-    this.configuring = false;
-    this.pendingKey = null;
     this.decoderPreference = 0;
     this.frames = 0;
     this.dropped = 0;
@@ -223,6 +239,12 @@ export class Phb1Player {
     this.decoder = null;
     this.configured = false;
     this.configuring = false;
+    this.verifiedConfiguration = null;
+  }
+
+  clearPendingPackets() {
+    this.pendingPackets.length = 0;
+    this.pendingBytes = 0;
   }
 
   setPresentation(mode) {
@@ -232,10 +254,28 @@ export class Phb1Player {
     // 勿把 width/height 置 0：Chromium 会回落到默认 300×150，竖屏窗里出现横条+大块黑边
   }
 
-  createDecoder() {
-    return new VideoDecoder({
+  /** 墙流切软解优先（官方 Gt）；大窗硬解优先 */
+  setWallMode(wall) {
+    const next = wall === true;
+    if (this.wall === next) return;
+    this.wall = next;
+    this.decoderPreferences = next ? DECODER_PREFS_WALL : DECODER_PREFS_FOREGROUND;
+    this.decoderPreference = 0;
+    // 偏好变更后从关键帧重建解码器，避免硬解墙流周期性尖峰卡顿
+    this.reset();
+  }
+
+  decoderCurrent(gen, description) {
+    return gen === this.generation && sameBytes(this.configuration, description);
+  }
+
+  createDecoder(description, gen, preference) {
+    const dec = new VideoDecoder({
       output: (frame) => {
         try {
+          if (!this.decoderCurrent(gen, description) || this.decoder !== dec) return;
+          if (this.needsKeyframe) return;
+          if (this.outputTimestampFloor != null && Number(frame.timestamp) < this.outputTimestampFloor) return;
           const fw = frame.displayWidth;
           const fh = frame.displayHeight;
           // 官方：横/竖模式与帧比例不一致时旋进 bitmap，避免仅 CSS rotate 被裁切
@@ -250,10 +290,10 @@ export class Phb1Player {
             this.canvas.height = th;
           }
           if (needRotate) {
-            // 与 presentationRotationFor 一致：270°（顺时针），避免横屏内容倒立
+            // 对齐商业 v1.7：translate(displayW,0) + rotate(+90°)
             this.ctx.save();
-            this.ctx.translate(0, th);
-            this.ctx.rotate(-Math.PI / 2);
+            this.ctx.translate(tw, 0);
+            this.ctx.rotate(Math.PI / 2);
             this.ctx.drawImage(frame, 0, 0, fw, fh);
             this.ctx.restore();
           } else {
@@ -267,17 +307,24 @@ export class Phb1Player {
           frame.close();
         }
       },
-      error: (e) => {
+      error: () => {
+        if (!this.decoderCurrent(gen, description) || this.decoder !== dec) return;
         this.needsKeyframe = true;
-        this.onError?.(e.message || String(e));
-        if (this.configuration) this.configureDecoder(this.decoderPreference + 1);
+        this.onError?.("解码恢复中，等待关键帧");
+        this.configureDecoder(preference + 1);
       },
     });
+    dec.ondequeue = () => {
+      if (this.decoderCurrent(gen, description) && this.decoder === dec) this.drainPendingPackets();
+    };
+    return dec;
   }
 
   async configureDecoder(preference = this.decoderPreference) {
     if (!this.configuration) return null;
     const gen = ++this.generation;
+    this.clearPendingPackets();
+    this.outputTimestampFloor = null;
     this.closeDecoder();
     this.needsKeyframe = true;
     this.configuring = true;
@@ -288,7 +335,7 @@ export class Phb1Player {
     for (let i = start; i < this.decoderPreferences.length; i++) {
       const opts = {
         codec,
-        description,
+        description: description.slice(),
         optimizeForLatency: true,
         hardwareAcceleration: this.decoderPreferences[i],
       };
@@ -298,49 +345,122 @@ export class Phb1Player {
       } catch {
         support = null;
       }
-      if (gen !== this.generation || !sameBytes(this.configuration, description)) return null;
+      if (!this.decoderCurrent(gen, description)) return null;
       if (support?.supported !== true) continue;
       try {
-        const dec = this.createDecoder();
+        const dec = this.createDecoder(description, gen, i);
         this.decoder = dec;
         this.decoderPreference = i;
         dec.configure(opts);
-        if (gen !== this.generation || this.decoder !== dec || !sameBytes(this.configuration, description)) {
-          try {
-            dec.close();
-          } catch {}
-          return null;
-        }
+        if (!this.decoderCurrent(gen, description) || this.decoder !== dec) return null;
+        this.verifiedConfiguration = opts;
         this.configured = true;
         this.configuring = false;
-        this.flushPendingKey();
+        this.drainPendingPackets();
         return codec;
       } catch {
-        if (gen === this.generation) this.closeDecoder();
+        if (this.decoderCurrent(gen, description) && this.decoder) {
+          try {
+            this.decoder.close();
+          } catch {}
+          this.decoder = null;
+        }
       }
     }
-    if (gen === this.generation) {
+    if (this.decoderCurrent(gen, description)) {
       this.configuring = false;
       this.configured = false;
+      this.dropped += this.pendingPackets.length;
+      this.clearPendingPackets();
     }
     return null;
   }
 
-  flushPendingKey() {
-    const data = this.pendingKey;
-    this.pendingKey = null;
-    if (!data || !this.decoder || this.decoder.state !== "configured") return;
+  /** 对齐商业版：积压时缓冲，关键帧清空队列；溢出则 reset 等下一 IDR */
+  bufferPendingPacket(packet) {
+    const ready =
+      !this.configuring && !this.needsKeyframe && this.decoder?.state === "configured";
+    if (packet.keyframe) {
+      this.dropped += this.pendingPackets.length;
+      this.clearPendingPackets();
+    } else if (!this.pendingPackets.length && !ready) {
+      this.dropped++;
+      return;
+    }
+    const limit = ready ? PENDING_WHEN_READY : PENDING_WHEN_BUSY;
+    if (this.pendingPackets.length >= limit || this.pendingBytes + packet.payload.byteLength > PENDING_BYTES_MAX) {
+      this.dropped += this.pendingPackets.length + 1;
+      this.clearPendingPackets();
+      if (!this.configuring) this.recoverDecoder();
+      return;
+    }
+    this.pendingPackets.push({
+      keyframe: packet.keyframe,
+      timestampUs: packet.timestampUs,
+      payload: packet.payload.slice(),
+    });
+    this.pendingBytes += packet.payload.byteLength;
+  }
+
+  drainPendingPackets() {
+    if (
+      this.drainingPending ||
+      this.configuring ||
+      this.decoder?.state !== "configured"
+    ) {
+      return;
+    }
+    const dec = this.decoder;
+    const gen = this.generation;
+    this.drainingPending = true;
     try {
-      this.decoder.decode(
+      while (this.pendingPackets.length && dec.decodeQueueSize <= DECODE_QUEUE_MAX) {
+        const next = this.pendingPackets.shift();
+        this.pendingBytes -= next.payload.byteLength;
+        this.decodePacket(next);
+        if (this.decoder !== dec || this.generation !== gen || this.configuring) break;
+      }
+    } finally {
+      this.drainingPending = false;
+    }
+  }
+
+  recoverDecoder() {
+    const dec = this.decoder;
+    const cfg = this.verifiedConfiguration;
+    if (this.configuring || !dec || dec.state !== "configured" || !cfg) return false;
+    this.clearPendingPackets();
+    this.needsKeyframe = true;
+    this.outputTimestampFloor = null;
+    try {
+      dec.reset();
+      dec.configure(cfg);
+      return this.decoder === dec && !this.configuring && dec.state === "configured";
+    } catch {
+      if (this.decoder === dec && !this.configuring) this.configureDecoder(this.decoderPreference + 1);
+      return false;
+    }
+  }
+
+  decodePacket(packet) {
+    if (this.needsKeyframe && !packet.keyframe) {
+      this.dropped++;
+      return;
+    }
+    if (this.needsKeyframe) this.outputTimestampFloor = packet.timestampUs;
+    this.needsKeyframe = false;
+    const dec = this.decoder;
+    try {
+      dec.decode(
         new EncodedVideoChunk({
-          type: "key",
-          timestamp: this.lastTs || 0,
-          data,
+          type: packet.keyframe ? "key" : "delta",
+          timestamp: packet.timestampUs,
+          data: packet.payload,
         })
       );
-      this.needsKeyframe = false;
     } catch {
-      this.needsKeyframe = true;
+      this.dropped++;
+      if (this.decoder === dec && !this.configuring) this.configureDecoder(this.decoderPreference + 1);
     }
   }
 
@@ -372,38 +492,28 @@ export class Phb1Player {
       this.dropped++;
       return p;
     }
-    if (this.configuring || !this.decoder || this.decoder.state !== "configured") {
-      if (p.keyframe) this.pendingKey = p.payload.slice();
+    if (this.configuring) {
+      this.bufferPendingPacket(p);
+      return p;
+    }
+    if (!this.decoder || this.decoder.state !== "configured") {
+      this.configureDecoder(this.decoder ? this.decoderPreference + 1 : this.decoderPreference);
+      this.bufferPendingPacket(p);
+      this.drainPendingPackets();
+      return p;
+    }
+    // 对齐商业版：积压先缓冲；关键帧可触发 recover 清队列，避免硬丢后等整段 GOP
+    if (this.pendingPackets.length || (this.decoder.decodeQueueSize > DECODE_QUEUE_MAX && !p.keyframe)) {
+      this.bufferPendingPacket(p);
+      this.drainPendingPackets();
+      return p;
+    }
+    if (this.decoder.decodeQueueSize > DECODE_QUEUE_MAX && !this.recoverDecoder()) {
+      if (this.configuring) this.bufferPendingPacket(p);
       else this.dropped++;
-      if (!this.configuring) this.configureDecoder(this.decoder ? this.decoderPreference + 1 : this.decoderPreference);
       return p;
     }
-    // 积压只丢当前帧；勿 needsKeyframe（否则等到下一个 IDR 会整段「卡一下」）
-    if (this.decoder.decodeQueueSize > 4) {
-      this.dropped++;
-      return p;
-    }
-    if (this.needsKeyframe && !p.keyframe) {
-      this.dropped++;
-      return p;
-    }
-
-    try {
-      this.decoder.decode(
-        new EncodedVideoChunk({
-          type: p.keyframe ? "key" : "delta",
-          timestamp: p.timestampUs,
-          data: p.payload,
-        })
-      );
-      if (p.keyframe) {
-        this.needsKeyframe = false;
-        this.pendingKey = null;
-      }
-    } catch {
-      this.dropped++;
-      this.configureDecoder(this.decoderPreference + 1);
-    }
+    this.decodePacket(p);
     return p;
   }
 }
@@ -763,6 +873,8 @@ export class VideoSession {
         reject(new Error("session closed"));
         return;
       }
+      // 对齐官方：wall profile 用 prefer-software，减轻小窗 1s IDR 硬解尖峰
+      this.player.setWallMode?.(streamProfile?.profile === "wall");
       const url = buildVideoUrl(this.baseWs, streamProfile);
       this.onStatus?.(initial ? "连接画面…" : "切换画质…");
       const ws = new WebSocket(url);
