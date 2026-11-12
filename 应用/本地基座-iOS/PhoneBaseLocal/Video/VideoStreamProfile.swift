@@ -23,6 +23,8 @@ struct VideoStreamProfile: Hashable {
 
     var isWall: Bool { profile == "wall" }
 
+    var bitrateMbps: Int { max(1, (bitrateBps + 500_000) / 1_000_000) }
+
     static func from(query: [String: String], defaults: VideoStreamProfile) -> VideoStreamProfile {
         let rawProfile = (query["profile"] ?? "foreground").lowercased()
         if rawProfile != "wall" {
@@ -75,7 +77,7 @@ struct VideoStreamProfile: Hashable {
             "maxDimension": maxDimension,
             "frameRate": frameRate,
             "bitrateBps": bitrateBps,
-            "bitrateMbps": Double(bitrateBps) / 1_000_000.0,
+            "bitrateMbps": bitrateMbps,
         ]
     }
 
@@ -114,38 +116,95 @@ struct VideoStreamProfile: Hashable {
 }
 
 /// 全局默认（foreground /api/video-settings）；墙流以 WS query 为准
+/// 字段对齐官方 `phonebase-video-settings` v1（商业端 Kc 校验）
 final class VideoSettingsStore {
     static let shared = VideoSettingsStore()
     private let lock = NSLock()
     private var _defaults = VideoStreamProfile.foregroundDefault
+    /// 0 = 自动（跟 frameRate）；>0 为用户请求值
+    private var requestedFrameRate = 0
+    private var maxFrameRate = 60
+    private var minBitrateMbps = 1
+    private var maxBitrateMbps = 20
+    /// 1000 = 100%；发送背压时下调（对齐官方 networkBitratePermille）
+    private var networkBitratePermille = 1000
     private var generation = 1
 
     var defaults: VideoStreamProfile {
         lock.lock(); defer { lock.unlock() }
-        return _defaults
+        return effectiveProfileLocked()
     }
 
     var status: [String: Any] {
         lock.lock(); defer { lock.unlock() }
-        var j = _defaults.json
-        j["generation"] = generation
-        j["protocol"] = "phonebase-video-settings"
-        return j
+        let p = effectiveProfileLocked()
+        return [
+            "supported": true,
+            "protocol": "phonebase-video-settings",
+            "version": 1,
+            "requestedFrameRate": requestedFrameRate,
+            "frameRate": p.frameRate,
+            "maxFrameRate": maxFrameRate,
+            "bitrateMbps": p.bitrateMbps,
+            "bitrateBps": p.bitrateBps,
+            "minBitrateMbps": minBitrateMbps,
+            "maxBitrateMbps": maxBitrateMbps,
+            "networkBitratePermille": networkBitratePermille,
+            "generation": generation,
+            "profile": p.profile,
+            "maxDimension": p.maxDimension,
+        ]
     }
 
     @discardableResult
     func apply(_ next: VideoStreamProfile) -> VideoStreamProfile {
         lock.lock()
-        // /api/video-settings 只改默认 foreground 码率/帧率；墙流仍看 WS query
+        let mbps = clamp(next.bitrateMbps, minBitrateMbps, maxBitrateMbps)
+        let fps = clamp(next.frameRate, 5, maxFrameRate)
+        if next.frameRate > 0 {
+            requestedFrameRate = fps
+        }
         _defaults = VideoStreamProfile(
             profile: "foreground",
             maxDimension: 0,
-            frameRate: next.frameRate,
-            bitrateBps: next.bitrateBps
+            frameRate: fps,
+            bitrateBps: mbps * 1_000_000
         )
         generation += 1
-        let out = _defaults
+        let out = effectiveProfileLocked()
         lock.unlock()
         return out
+    }
+
+    /// 拥塞反馈：permille∈[400,1000]
+    func setNetworkBitratePermille(_ permille: Int) {
+        lock.lock()
+        let next = clamp(permille, 400, 1000)
+        let changed = next != networkBitratePermille
+        networkBitratePermille = next
+        if changed { generation += 1 }
+        lock.unlock()
+    }
+
+    func networkBitratePermilleValue() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return networkBitratePermille
+    }
+
+    private func effectiveProfileLocked() -> VideoStreamProfile {
+        let base = _defaults
+        let br = max(400_000, base.bitrateBps * networkBitratePermille / 1000)
+        let minBps = minBitrateMbps * 1_000_000
+        let maxBps = maxBitrateMbps * 1_000_000
+        return VideoStreamProfile(
+            profile: "foreground",
+            maxDimension: 0,
+            frameRate: base.frameRate,
+            bitrateBps: min(maxBps, max(minBps, br))
+        )
+    }
+
+    private func clamp(_ v: Int, _ lo: Int, _ hi: Int) -> Int {
+        min(hi, max(lo, v))
     }
 }

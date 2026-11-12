@@ -27,6 +27,8 @@ final class LocalHTTPServer {
 
     var bonjourName: String = "PhoneBaseLocal"
     var bonjourTXT: [String: String] = [:]
+    /// USB 口（11021）不发 Bonjour，避免和 Wi‑Fi 11019 抢名
+    var advertiseBonjour: Bool = true
 
     init(port: UInt16) {
         self.port = port
@@ -72,7 +74,9 @@ final class LocalHTTPServer {
         acceptCount = 0
         NSLog("[HTTP] BSD listen ready port=%u fd=%d", port, fd)
         acceptQueue.async { [weak self] in self?.acceptLoop() }
-        DispatchQueue.main.async { [weak self] in self?.publishBonjour() }
+        if advertiseBonjour {
+            DispatchQueue.main.async { [weak self] in self?.publishBonjour() }
+        }
     }
 
     func stop() {

@@ -38,8 +38,13 @@ final class FramePublisher {
     private final class Client {
         let session: WebSocketSession
         var profile: VideoStreamProfile
+        /// 对齐官方 _dropUntilKeyframe：发送背压后只等关键帧，期间丢弃 delta
         var congested = false
         var lastKeyRequestMs: UInt64 = 0
+        /// 对齐 discardUnsentVideo：尚未开写的出站视频帧可整帧丢弃/替换
+        var pendingVideo: Data?
+        var pendingIsKeyframe = false
+        var healthySinceMs: UInt64 = 0
         init(session: WebSocketSession, profile: VideoStreamProfile) {
             self.session = session
             self.profile = profile
@@ -246,7 +251,65 @@ final class FramePublisher {
             c.profile = d
         }
         lock.unlock()
+        // 用户改 /api/video-settings：重建前景车道（profile.key 含码率/帧率）
         recycleEncoder(reason: "video-settings")
+    }
+
+    /// ABR 热更新：不改 lane key，只调编码器码率
+    private func applyEffectiveBitrateToForegroundLanesLocked() {
+        let d = VideoSettingsStore.shared.defaults
+        for lane in lanes.values where !lane.profile.isWall {
+            lane.encoder.updateRate(bitrateBps: d.bitrateBps, frameRate: d.frameRate)
+        }
+    }
+
+    /// 对齐官方 networkBitratePermille：有客户端背压则降码率，恢复后抬回
+    private func refreshNetworkBitrateLocked(nowMs: UInt64) {
+        let anyCongested = clients.contains(where: \.congested)
+        let cur = VideoSettingsStore.shared.networkBitratePermilleValue()
+        if anyCongested {
+            let next = max(400, cur - 150)
+            if next != cur {
+                VideoSettingsStore.shared.setNetworkBitratePermille(next)
+                applyEffectiveBitrateToForegroundLanesLocked()
+            }
+            return
+        }
+        // 连续健康 ≥2s 再抬升，避免抖动
+        if clients.contains(where: { $0.healthySinceMs != 0 && nowMs &- $0.healthySinceMs >= 2000 }), cur < 1000 {
+            let next = min(1000, cur + 100)
+            VideoSettingsStore.shared.setNetworkBitratePermille(next)
+            applyEffectiveBitrateToForegroundLanesLocked()
+        }
+    }
+
+    /// 对齐 discardUnsentVideo：发送前丢掉未开写的旧视频帧；关键帧清空积压
+    private func enqueueOrSend(_ client: Client, packet: Data, keyframe: Bool, lane: Lane?) {
+        if keyframe {
+            client.pendingVideo = nil
+            client.pendingIsKeyframe = false
+        } else if client.pendingVideo != nil {
+            // 旧 delta 未发出 → 丢弃（官方 offset==0 的 video 帧）
+            client.pendingVideo = nil
+            client.pendingIsKeyframe = false
+        }
+        if client.session.sendBinary(packet) {
+            client.congested = false
+            if client.healthySinceMs == 0 {
+                client.healthySinceMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
+            }
+            return
+        }
+        client.congested = true
+        client.healthySinceMs = 0
+        // 发不动：只挂起最新一帧，等待下一轮或关键帧
+        client.pendingVideo = packet
+        client.pendingIsKeyframe = keyframe
+        let nowMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
+        if keyframe || nowMs &- client.lastKeyRequestMs >= 1000 {
+            client.lastKeyRequestMs = nowMs
+            lane?.encoder.forceKeyFrame()
+        }
     }
 
     @discardableResult
@@ -290,28 +353,36 @@ final class FramePublisher {
         lock.lock()
         let targets = clients.filter { $0.profile.key == laneKey }
         let lane = lanes[laneKey]
-        lock.unlock()
         let nowMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
         for c in targets {
+            // 先尝试刷出挂起帧（discardUnsent 后只留最新）
+            if let pending = c.pendingVideo {
+                if c.session.sendBinary(pending) {
+                    c.pendingVideo = nil
+                    c.pendingIsKeyframe = false
+                    c.congested = false
+                    if c.healthySinceMs == 0 { c.healthySinceMs = nowMs }
+                } else {
+                    c.congested = true
+                    c.healthySinceMs = 0
+                }
+            }
             if c.congested && !keyframe {
-                // 背压后若关键帧一直发不出去，必须周期性再要 IDR，否则墙流会停在旧画面
-                if nowMs &- c.lastKeyRequestMs >= 400 {
+                // discardUnsent：背压期间丢掉未发出的旧 delta，避免排队变旧画面
+                if c.pendingVideo != nil, !c.pendingIsKeyframe {
+                    c.pendingVideo = nil
+                }
+                // 对齐官方 dropUntilKeyframe：等自然 GOP；最多约 1s 再要一次
+                if nowMs &- c.lastKeyRequestMs >= 1000 {
                     c.lastKeyRequestMs = nowMs
                     lane?.encoder.forceKeyFrame()
                 }
                 continue
             }
-            if c.session.sendBinary(packet) {
-                if keyframe { c.congested = false }
-            } else {
-                let firstStall = !c.congested
-                c.congested = true
-                if firstStall || (keyframe && nowMs &- c.lastKeyRequestMs >= 200) {
-                    c.lastKeyRequestMs = nowMs
-                    lane?.encoder.forceKeyFrame()
-                }
-            }
+            enqueueOrSend(c, packet: packet, keyframe: keyframe, lane: lane)
         }
+        refreshNetworkBitrateLocked(nowMs: nowMs)
+        lock.unlock()
     }
 }
 

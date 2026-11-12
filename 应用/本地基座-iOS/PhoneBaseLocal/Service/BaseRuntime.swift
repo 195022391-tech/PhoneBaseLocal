@@ -6,10 +6,13 @@ final class BaseRuntime {
     static let shared = BaseRuntime()
 
     let port: UInt16 = 11019
+    /// 官方 USB usbmux Connect 目标端口（phonebase-usb-v1）
+    let usbPort: UInt16 = 11021
     private(set) var isRunning = false
     var onStatus: ((String) -> Void)?
 
     private let server: LocalHTTPServer
+    private let usbServer: LocalHTTPServer
     private let publisher: FramePublisher
     private let controlHub: ControlHub
     private let capture: DisplayCapture
@@ -58,30 +61,39 @@ final class BaseRuntime {
             "deviceId": cachedDeviceId,
             "port": String(port),
         ]
+        usbServer = LocalHTTPServer(port: usbPort)
+        usbServer.advertiseBonjour = false
 
-        server.onInfo = { [weak self] in self?.infoJSON() ?? Data() }
-        server.onHealth = { [weak self] in
-            let n = self?.server.acceptCount ?? 0
-            return Data("{\"ok\":true,\"protocol\":\"lan-phonebase\",\"version\":\"1.0\",\"accept\":\(n)}".utf8)
-        }
-        server.onAccepted = { [weak self] count, ip in
-            self?.notify("有连接 #\(count) from \(ip)")
-        }
-        server.onVideoConnect = { [weak self] session, query in
+        let wire: (LocalHTTPServer) -> Void = { [weak self] srv in
             guard let self else { return }
-            let profile = VideoStreamProfile.from(query: query, defaults: VideoSettingsStore.shared.defaults)
-            self.publisher.attach(session, profile: profile)
+            let listenPort = srv === self.usbServer ? self.usbPort : self.port
+            srv.onInfo = { [weak self] in self?.infoJSON(listenPort: listenPort) ?? Data() }
+            srv.onHealth = { [weak self] in
+                let n = (self?.server.acceptCount ?? 0) + (self?.usbServer.acceptCount ?? 0)
+                return Data("{\"ok\":true,\"protocol\":\"lan-phonebase\",\"version\":\"1.0\",\"accept\":\(n)}".utf8)
+            }
+            srv.onAccepted = { [weak self] count, ip in
+                let tag = listenPort == self?.usbPort ? "USB" : "LAN"
+                self?.notify("有连接 #\(count) \(tag) from \(ip)")
+            }
+            srv.onVideoConnect = { [weak self] session, query in
+                guard let self else { return }
+                let profile = VideoStreamProfile.from(query: query, defaults: VideoSettingsStore.shared.defaults)
+                self.publisher.attach(session, profile: profile)
+            }
+            srv.onControlConnect = { [weak self] session in
+                self?.controlHub.attach(session)
+            }
+            srv.onControlAPI = { [weak self] path, query in
+                self?.handleControlAPI(path: path, query: query) ?? Data(#"{"ok":false}"#.utf8)
+            }
+            srv.onVideoSettings = { [weak self] method, query, body in
+                self?.handleVideoSettings(method: method, query: query, body: body)
+                    ?? Data(#"{"ok":false}"#.utf8)
+            }
         }
-        server.onControlConnect = { [weak self] session in
-            self?.controlHub.attach(session)
-        }
-        server.onControlAPI = { [weak self] path, query in
-            self?.handleControlAPI(path: path, query: query) ?? Data(#"{"ok":false}"#.utf8)
-        }
-        server.onVideoSettings = { [weak self] method, query, body in
-            self?.handleVideoSettings(method: method, query: query, body: body)
-                ?? Data(#"{"ok":false}"#.utf8)
-        }
+        wire(server)
+        wire(usbServer)
 
         publisher.onTimestampUs = { [weak self] ts in
             self?.controlHub.latestFrameTimestampUs = ts
@@ -114,10 +126,9 @@ final class BaseRuntime {
             self?.publisher.applyDefaultsFromSettings()
             self?.notify("画质已更新 · \(applied.frameRate)fps · \(applied.bitrateBps / 1000)kbps")
         }
-        var out = applied.json
+        // 对齐商业 Kc：返回完整 phonebase-video-settings v1 字段
+        var out = VideoSettingsStore.shared.status
         out["ok"] = true
-        out["generation"] = VideoSettingsStore.shared.status["generation"] as Any
-        out["protocol"] = "phonebase-video-settings"
         return (try? JSONSerialization.data(withJSONObject: out)) ?? Data(#"{"ok":true}"#.utf8)
     }
 
@@ -176,6 +187,17 @@ final class BaseRuntime {
         return (try? JSONSerialization.data(withJSONObject: body)) ?? Data(#"{"ok":true}"#.utf8)
     }
 
+    private func startListeners() throws {
+        try server.start()
+        do {
+            try usbServer.start()
+        } catch {
+            // USB 口失败不阻断 Wi‑Fi；数据线模式不可用
+            NSLog("[Runtime] USB listen %u failed: %@", usbPort, "\(error)")
+            usbServer.stop()
+        }
+    }
+
     @discardableResult
     func start(notifyStatus: Bool = true) -> Bool {
         guard !isRunning else { return true }
@@ -184,7 +206,7 @@ final class BaseRuntime {
             usleep(200_000)
         }
         do {
-            try server.start()
+            try startListeners()
             capture.start()
             isRunning = true
             BackgroundKeepAlive.shared.start()
@@ -197,9 +219,10 @@ final class BaseRuntime {
             return true
         } catch {
             let freed = PortOccupancy.freePort(port)
+            _ = PortOccupancy.freePort(usbPort)
             usleep(200_000)
             do {
-                try server.start()
+                try startListeners()
                 capture.start()
                 isRunning = true
                 BackgroundKeepAlive.shared.start()
@@ -226,6 +249,7 @@ final class BaseRuntime {
         publisher.detachAll()
         controlHub.detachAll()
         server.stop()
+        usbServer.stop()
         isRunning = false
         BackgroundKeepAlive.shared.stop()
         notify("服务已停止")
@@ -281,7 +305,8 @@ final class BaseRuntime {
     private func startupMessage(retired: [String], extra: String?) -> String {
         let ips = LanAddress.ipv4List().joined(separator: ", ")
         var msg = "服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)"
-        msg += "\nbuild=0.1.36-wall-sync"
+        msg += "\nUSB=\(usbPort) (phonebase-usb-v1)"
+        msg += "\nbuild=0.1.37-usb"
         msg += "\ncapture=\(capture.backendName) encode=\(encodeW)x\(encodeH)"
         msg += "\ndeviceId=\(cachedDeviceId)"
         msg += "\nmemoryGuard=\(MemoryGuard.shared.automatic ? "on" : "off")"
@@ -301,15 +326,16 @@ final class BaseRuntime {
         onStatus?(text)
     }
 
-    private func infoJSON() -> Data {
+    private func infoJSON(listenPort: UInt16) -> Data {
         let w = screenWidth
         let h = screenHeight
-        let body: [String: Any] = [
+        let viaUsb = listenPort == usbPort
+        var body: [String: Any] = [
             "protocol": "lan-phonebase",
             "version": "1.0",
             "deviceId": cachedDeviceId,
             "name": cachedName,
-            "port": Int(port),
+            "port": Int(listenPort),
             "streaming": capture.isActive,
             "captureBackend": capture.backendName,
             "captureState": capture.isActive ? "capturing" : "idle",
@@ -323,13 +349,17 @@ final class BaseRuntime {
             "keyboardAvailable": hidReady,
             "wallVideo": true,
             "licenseRequired": false,
+            // 能力宣告：Wi‑Fi info 也带上，便于桌面识别可 USB
+            "usbSupported": true,
+            "usbProtocol": "phonebase-usb-v1",
+            "usbPort": Int(usbPort),
             "encoder": publisher.encoderStats,
             "videoSettings": VideoSettingsStore.shared.status,
             "memoryGuard": MemoryGuard.shared.status,
             "release": [
                 "product": "local",
-                "version": "0.1.36",
-                "buildId": "local-rebuild-0.1.36-wall-sync",
+                "version": "0.1.37",
+                "buildId": "local-rebuild-0.1.37-usb",
             ],
             "geometry": [
                 "width": w,
@@ -341,6 +371,9 @@ final class BaseRuntime {
                 "changedAtUs": Int(Date().timeIntervalSince1970 * 1_000_000),
             ],
         ]
+        if viaUsb {
+            body["usbTransport"] = true
+        }
         return (try? JSONSerialization.data(withJSONObject: body, options: [])) ?? Data()
     }
 }

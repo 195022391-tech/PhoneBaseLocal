@@ -59,10 +59,33 @@ final class H264Encoder {
 
     func updateRate(bitrateBps: Int, frameRate: Int) {
         queue.async {
-            self.bitrateBps = max(400_000, bitrateBps)
-            self.frameRate = max(5, min(60, frameRate))
-            self.recreateNeeded = true
+            let br = max(400_000, bitrateBps)
+            let fr = max(5, min(60, frameRate))
+            let bitrateChanged = br != self.bitrateBps
+            let fpsChanged = fr != self.frameRate
+            self.bitrateBps = br
+            self.frameRate = fr
+            // 对齐官方 applyBitrateBps：会话仍在时热更新码率/峰值，避免整会话重建尖峰
+            guard let sess = self.session else { return }
+            if bitrateChanged {
+                self.applyBitrateLocked(sess, bitrateBps: br)
+            }
+            if fpsChanged {
+                VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fr as CFNumber)
+                VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: fr as CFNumber)
+                VTSessionSetProperty(
+                    sess,
+                    key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+                    value: 1 as CFNumber
+                )
+            }
         }
+    }
+
+    private func applyBitrateLocked(_ sess: VTCompressionSession, bitrateBps: Int) {
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateBps as CFNumber)
+        let limits: [NSNumber] = [NSNumber(value: bitrateBps / 8), NSNumber(value: 1)]
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_DataRateLimits, value: limits as CFArray)
     }
 
     func forceKeyFrame() {
@@ -172,17 +195,22 @@ final class H264Encoder {
             return
         }
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateBps as CFNumber)
+        applyBitrateLocked(sess, bitrateBps: bitrateBps)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: frameRate as CFNumber)
-        // ~2s GOP：比每秒 IDR 少尖峰；比 3s+ 恢复更快
-        let gop = max(frameRate * 2, 30)
+        // 对齐官方 PBVideoEncoder：1s GOP（帧数=fps，时长=1s）+ 峰值限制，避免每 2s IDR 尖峰卡一下
         VTSessionSetProperty(
             sess,
             key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
-            value: gop as CFNumber
+            value: frameRate as CFNumber
         )
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        VTSessionSetProperty(
+            sess,
+            key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+            value: 1 as CFNumber
+        )
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
         VTCompressionSessionPrepareToEncodeFrames(sess)
         session = sess
         sentConfig = false
