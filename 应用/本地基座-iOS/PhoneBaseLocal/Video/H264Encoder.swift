@@ -72,16 +72,18 @@ final class H264Encoder {
             }
             if fpsChanged {
                 VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fr as CFNumber)
+                // 官方：MaxKeyFrameInterval = fps，Duration = 1s
                 VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: fr as CFNumber)
                 VTSessionSetProperty(
                     sess,
                     key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-                    value: 1 as CFNumber
+                    value: NSNumber(value: 1.0)
                 )
             }
         }
     }
 
+    /// 官方 applyBitrateBps：AverageBitRate + DataRateLimits=[bitrate/8, 1]
     private func applyBitrateLocked(_ sess: VTCompressionSession, bitrateBps: Int) {
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateBps as CFNumber)
         let limits: [NSNumber] = [NSNumber(value: bitrateBps / 8), NSNumber(value: 1)]
@@ -194,12 +196,15 @@ final class H264Encoder {
             NSLog("[H264] VTCompressionSessionCreate failed status=%d size=%dx%d", status, width, height)
             return
         }
+        // 官方 PBVideoEncoder：RealTime + 不重排 + MaxFrameDelayCount=0
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
+        // DataRateLimits=[bitrate/8, 1]：约 1s 窗口峰值 ≈ 平均码率
         applyBitrateLocked(sess, bitrateBps: bitrateBps)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: frameRate as CFNumber)
-        // 对齐官方 PBVideoEncoder：1s GOP（帧数=fps，时长=1s）+ 峰值限制，避免每 2s IDR 尖峰卡一下
+        // 1s GOP：Interval=fps，Duration=1.0s（避免更长 GOP 的更大 IDR 尖峰）
         VTSessionSetProperty(
             sess,
             key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
@@ -208,16 +213,18 @@ final class H264Encoder {
         VTSessionSetProperty(
             sess,
             key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-            value: 1 as CFNumber
+            value: NSNumber(value: 1.0)
         )
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
         VTCompressionSessionPrepareToEncodeFrames(sess)
         session = sess
         sentConfig = false
         forceNextKeyFrame = true
         recreateNeeded = false
         ready = true
-        NSLog("[H264] encoder ready %dx%d br=%d fps=%d", width, height, bitrateBps, frameRate)
+        NSLog(
+            "[H264] encoder ready %dx%d br=%d fps=%d gop=1s dataRateLimits=%dB/1s",
+            width, height, bitrateBps, frameRate, bitrateBps / 8
+        )
     }
 
     private func closeSessionLocked() {
